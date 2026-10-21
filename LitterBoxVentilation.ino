@@ -18,18 +18,27 @@ constexpr uint8_t RELAY_PIN = 5;
 // 继电器输入有效电平配置：
 // true  = 低电平触发，GPIO 输出 LOW 时继电器吸合。
 // false = 高电平触发，GPIO 输出 HIGH 时继电器吸合。
-// 如果继电器动作和风机状态相反，先核对模块触发方式，再修改此值。
-constexpr bool RELAY_ACTIVE_LOW = true;
+// 依据当前实测（COM 接 12V+、NO 接风机正极，但风机状态与 RGB 指示相反），
+// 先按高电平触发配置；重新测试后若仍相反，再核对继电器模块说明和 IN 指示灯。
+constexpr bool RELAY_ACTIVE_LOW = false;
 
-// PIR 不再检测到移动后，风机继续运行的时间。
-// 当前设为 10 秒便于调试；稳定后可改为 3–5 分钟。
-constexpr unsigned long EXHAUST_DELAY_MS = 10UL * 1000UL;
+// 时序配置：当前先用 DEMO 模式做快速联调。
+// DEMO_MODE = true：每 10ms 检查一次 PIR；PIR 恢复 LOW 后继续吹 10 秒，且至少运行 10 秒。
+// 正式使用时改为 false：每 50ms 检查一次；PIR 恢复 LOW 后继续吹 3 分钟，且至少运行 30 秒。
+// 注意：PIR 模块自身输出 HIGH 的保持时长由模块上的电位器决定，代码不能缩短它。
+constexpr bool DEMO_MODE = true;
+constexpr unsigned long PIR_POLL_INTERVAL_MS = DEMO_MODE ? 10UL : 50UL;
+constexpr unsigned long EXHAUST_DELAY_MS = DEMO_MODE ? 10UL * 1000UL : 3UL * 60UL * 1000UL;
+constexpr unsigned long FAN_MIN_RUN_MS = DEMO_MODE ? 10UL * 1000UL : 30UL * 1000UL;
 
 // 当前风机逻辑状态。用于避免每轮 loop 都重复写继电器并重复打印日志。
 bool fanOn = false;
 
 // 最近一次检测到移动的 millis() 时间戳，用于计算延时排风时长。
 unsigned long lastPresenceMs = 0;
+
+// 风机最近一次启动的时间戳，用于保证最短运行时间。
+unsigned long fanStartedMs = 0;
 
 // 返回继电器吸合时 GPIO 应输出的电平。
 uint8_t relayOnLevel() {
@@ -49,19 +58,21 @@ void setFan(bool turnOn) {
   }
 
   fanOn = turnOn;
+  if (fanOn) {
+    fanStartedMs = millis();
+  }
+
   // 根据继电器模块的有效电平，输出吸合或释放电平。
   digitalWrite(RELAY_PIN, fanOn ? relayOnLevel() : relayOffLevel());
-  Serial.println(fanOn ? "Fan: ON" : "Fan: OFF");
+  Serial.printf("[%lu ms] Fan: %s\n", millis(), fanOn ? "ON" : "OFF");
 }
 
 void setup() {
   // 调试串口使用 115200 波特率。
   Serial.begin(115200);
 
-  // 初始化板载 RGB 状态灯，并闪烁三次绿色作为启动提示。
-  statusLedBegin();
-
-  // 先预置继电器关闭电平，再切换为输出，尽量避免上电瞬间误吸合。
+  // 尽早将继电器设为关闭状态，避免启动提示灯闪烁期间继电器输入悬空。
+  // 先写关闭电平，再设为输出，可尽量避免 GPIO 切换时的误动作。
   digitalWrite(RELAY_PIN, relayOffLevel());
   pinMode(RELAY_PIN, OUTPUT);
   digitalWrite(RELAY_PIN, relayOffLevel());
@@ -69,10 +80,18 @@ void setup() {
   // PIR 输出作为数字输入；本程序约定 HIGH 表示检测到移动目标。
   pinMode(PIR_PIN, INPUT);
 
+  // 初始化板载 RGB 状态灯，并闪烁三次绿色作为启动提示。
+  statusLedBegin();
+
   Serial.println();
   Serial.println("LitterBoxVentilation ready");
   Serial.println("PIR: GPIO4, Relay: GPIO5");
   Serial.println("Status LED: GPIO8 WS2812");
+  Serial.println("Relay initialized to OFF");
+  Serial.printf("Timing mode: %s; exhaust delay: %lu ms; minimum run: %lu ms\n",
+                DEMO_MODE ? "DEMO" : "PRODUCTION",
+                EXHAUST_DELAY_MS,
+                FAN_MIN_RUN_MS);
   Serial.println("Waiting for presence...");
 }
 
@@ -82,18 +101,27 @@ void loop() {
 
   // 读取 PIR 当前电平。HIGH 时认为有移动，立即开启风机并刷新延时起点。
   const bool presenceDetected = digitalRead(PIR_PIN) == HIGH;
+  static bool previousPresenceDetected = false;
+
+  // 只在 PIR 电平变化时打印，便于从串口判断是否发生了重复触发。
+  if (presenceDetected != previousPresenceDetected) {
+    Serial.printf("[%lu ms] PIR: %s\n", now, presenceDetected ? "HIGH" : "LOW");
+    previousPresenceDetected = presenceDetected;
+  }
 
   if (presenceDetected) {
     lastPresenceMs = now;
     setFan(true);
-  // PIR 已恢复 LOW，且从最后一次检测到移动起已超过延时时间，则关闭风机。
-  } else if (fanOn && (now - lastPresenceMs >= EXHAUST_DELAY_MS)) {
+  // PIR 已恢复 LOW 后，满足延时排风和最短运行时间两个条件才关闭风机。
+  } else if (fanOn &&
+             (now - lastPresenceMs >= EXHAUST_DELAY_MS) &&
+             (now - fanStartedMs >= FAN_MIN_RUN_MS)) {
     setFan(false);
   }
 
   // 将当前风机状态传给状态灯模块：待机慢速蓝色呼吸，运行快速橙色呼吸。
   statusLedUpdate(fanOn, now);
 
-  // 降低轮询频率，避免空转占用 CPU；50ms 对 PIR 状态检测足够。
-  delay(50);
+  // 按调试/正式模式配置的间隔轮询 PIR，避免无意义地高速占用 CPU。
+  delay(PIR_POLL_INTERVAL_MS);
 }
