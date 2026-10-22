@@ -1,0 +1,10 @@
+# macOS
+.DS_Store
+
+# Arduino / PlatformIO 构建产物
+build/
+.pio/
+*.o
+*.elf
+*.bin
+*.map

@@ -1,0 +1,7 @@
+#pragma once
+
+// 遵循语义化版本：MAJOR.MINOR.PATCH。功能兼容的小改动增加 PATCH，新增功能增加 MINOR。
+#define FIRMWARE_VERSION_MAJOR 0
+#define FIRMWARE_VERSION_MINOR 1
+#define FIRMWARE_VERSION_PATCH 0
+#define FIRMWARE_VERSION "0.1.0"

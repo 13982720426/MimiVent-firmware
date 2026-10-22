@@ -1,11 +1,14 @@
+// 板载 WS2812 指示灯实现，仅通过 StatusLed.h 暴露状态更新接口。
 #include "StatusLed.h"
 
 #include <Adafruit_NeoPixel.h>
 
+#include "AppConfig.h"
+
 namespace {
 
 // 板载 WS2812 RGB 灯的数据引脚和灯珠数量。
-constexpr uint8_t STATUS_LED_PIN = 8;
+constexpr uint8_t STATUS_LED_PIN = AppConfig::kStatusLedPin;
 constexpr uint8_t STATUS_LED_COUNT = 1;
 
 // 将 NeoPixel 对象限制在本文件内，避免主程序直接依赖灯带实现细节。
@@ -39,9 +42,8 @@ void statusLedUpdate(bool fanOn, unsigned long nowMs) {
   // phase 在每个 periodMs 周期内循环，halfPeriod 是升亮和变暗的分界点。
   const unsigned long phase = nowMs % periodMs;
   const unsigned long halfPeriod = periodMs / 2;
-  const unsigned long triangle = phase < halfPeriod
-      ? phase * 255UL / halfPeriod
-      : (periodMs - phase) * 255UL / halfPeriod;
+  const unsigned long triangle =
+      phase < halfPeriod ? phase * 255UL / halfPeriod : (periodMs - phase) * 255UL / halfPeriod;
   const uint8_t brightness = static_cast<uint8_t>(triangle * peakBrightness / 255UL);
 
   // 待机选择蓝色，运行选择橙色；下面再按呼吸亮度缩放各颜色通道。
@@ -50,12 +52,9 @@ void statusLedUpdate(bool fanOn, unsigned long nowMs) {
   const uint8_t blue = fanOn ? 0 : 200;
 
   // 分别缩放 RGB 三个通道，避免频繁调用 setBrightness 带来的像素缓冲缩放误差。
-  statusLed.setPixelColor(
-      0,
-      statusLed.Color(
-          static_cast<uint8_t>(red * brightness / 255),
-          static_cast<uint8_t>(green * brightness / 255),
-          static_cast<uint8_t>(blue * brightness / 255)));
+  statusLed.setPixelColor(0, statusLed.Color(static_cast<uint8_t>(red * brightness / 255),
+                                             static_cast<uint8_t>(green * brightness / 255),
+                                             static_cast<uint8_t>(blue * brightness / 255)));
 
   // 将计算好的 RGB 值发送到板载 WS2812 灯珠。
   statusLed.show();
