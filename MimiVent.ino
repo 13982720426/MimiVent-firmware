@@ -11,6 +11,7 @@
 */
 
 #include "AppConfig.h"
+#include "BluetoothManager.h"
 #include "FanController.h"
 #include "FirmwareVersion.h"
 #include "StatusLed.h"
@@ -27,12 +28,14 @@ void setup() {
 
   const bool accessPointStarted = wifiManagerBegin();
   webDashboardBegin();
+  bluetoothManagerBegin();
 
   Serial.println();
   Serial.printf("MimiVent v%s ready\n", FIRMWARE_VERSION);
   Serial.printf("AP: %s / %s\n", AppConfig::kApSsid, AppConfig::kApPassword);
   Serial.printf("Dashboard: http://%s\n", wifiManagerGetIp().c_str());
   Serial.printf("AP status: %s\n", accessPointStarted ? "started" : "failed");
+  Serial.printf("BLE device: %s\n", AppConfig::kBleDeviceName);
   const TimingSettings production = settingsStoreGet(TimingProfile::PRODUCTION);
   const TimingSettings dev = settingsStoreGet(TimingProfile::DEV);
   Serial.printf("Production timing: startup cooldown %lu ms; leave %lu ms; automatic exhaust %lu ms; manual %lu ms; pause %lu ms\n",
@@ -47,6 +50,7 @@ void loop() {
   // 先处理网页命令，再读取时钟。命令处理器可能刚设置 overrideStartedMs；
   // 若使用处理请求之前保存的 nowMs，unsigned 差值会下溢并让定时模式立即到期。
   webDashboardUpdate();
+  bluetoothManagerUpdate();
 
   const unsigned long nowMs = millis();
   fanControllerUpdate(nowMs);

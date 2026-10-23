@@ -1,6 +1,6 @@
 # MimiVent
 
-ESP32-C3-DevKitM-1 单猫砂盆自动排风固件，包含本地手机网页控制台。当前基础方案使用 **1 个猫砂盆、1 个 PIR、1 台风机**；设备开机后先执行启动冷静期，再进入 PIR 自动感应。手机页面可查看 PIR/风机状态，临时强制开/关均可设定时长，另有需要二次确认的持续关闭锁。三通、第二段支管和第二个 PIR 是连接第二个猫砂盆时才需要的可选扩展，不属于当前基础方案的必需配件。本文档对应首个正式版本 `v0.1.0`，包含准备环境、接线、编译、烧录及功能验证说明。
+ESP32-C3-DevKitM-1 单猫砂盆自动排风固件，包含本地手机网页控制台和 BLE 网页控制。当前基础方案使用 **1 个猫砂盆、1 个 PIR、1 台风机**；设备开机后先执行启动冷静期，再进入 PIR 自动感应。手机页面可查看 PIR/风机状态，临时强制开/关均可设定时长，另有需要二次确认的持续关闭锁。三通、第二段支管和第二个 PIR 是连接第二个猫砂盆时才需要的可选扩展，不属于当前基础方案的必需配件。当前固件版本为 `v0.2.0`。
 
 ## 项目启动前准备
 
@@ -32,9 +32,9 @@ ESP32-C3-DevKitM-1 单猫砂盆自动排风固件，包含本地手机网页控�
 ### 软件与开发环境
 
 - macOS、Windows 或 Linux 均可开发；Arduino IDE 2.x 可用于编辑、编译和烧录。本项目不要求 Windows。
-- 需要安装的软件：Arduino IDE 2.x、Espressif Systems 的 `esp32` 板卡包、`Adafruit NeoPixel` 库。
+- 需要安装的软件：Arduino IDE 2.x、Espressif Systems 的 `esp32` 板卡包、`Adafruit NeoPixel` 库、`NimBLE-Arduino` 库。
 - `WiFi`、`WebServer` 和 `Preferences`（NVS 配置存储）库由 ESP32 Arduino core 自带，不要在 Library Manager 里另外安装同名库。
-- 当前已验证的构建组合：Arduino IDE 2.3.10、ESP32 Arduino core `esp32:esp32` 3.3.12、Adafruit NeoPixel 1.15.5。其他版本可能可用；遇到编译差异时，先回到这组版本复现。
+- 当前构建组合：Arduino IDE 2.3.10、ESP32 Arduino core `esp32:esp32` 3.3.12、Adafruit NeoPixel 1.15.5、NimBLE-Arduino 2.5.1。Wi-Fi 自动排风版本已实机验证；BLE 版本目前只完成编译，仍需实机验证。
 - 将本仓库整个项目目录放在 Arduino sketchbook 下，保持目录名和主 `.ino` 文件名一致：`MimiVent/MimiVent.ino`。
 - 首次接线烧录时使用 USB 数据线连接开发板；在 IDE 中选择对应串口和 `ESP32C3 Dev Module` 板卡配置。
 
@@ -56,6 +56,12 @@ ESP32-C3-DevKitM-1 单猫砂盆自动排风固件，包含本地手机网页控�
 1. 打开左侧 **Library Manager（库管理器）**。
 2. 搜索 `Adafruit NeoPixel`。
 3. 选择作者为 **Adafruit** 的库并点击 **Install（安装）**。如果 IDE 提示同时安装依赖，按提示一并安装。
+
+#### 安装 NimBLE-Arduino 库
+
+1. 打开 **Library Manager（库管理器）**。
+2. 搜索 `NimBLE-Arduino`，选择作者为 **h2zero** 的库并安装 `2.5.1`。
+3. 本项目使用 BLE-only 的 NimBLE 栈；不要另外安装/引用 ESP32 core 自带的 `BLE`（Bluedroid）库。
 
 #### 选择 C3 开发板和串口
 
@@ -134,7 +140,7 @@ DCP3512 GND ─────────────── ESP32 GND、PIR GND
 
 ## 从零编译与烧录
 
-1. 按照“软件与开发环境”一节安装 Arduino IDE、Espressif `esp32` 板卡包和 Adafruit `Adafruit NeoPixel` 库。
+1. 按照“软件与开发环境”一节安装 Arduino IDE、Espressif `esp32` 板卡包、Adafruit `Adafruit NeoPixel` 和 NimBLE-Arduino 库。
 2. 在 Finder/文件管理器中打开项目目录，并用 Arduino IDE 打开 `MimiVent.ino`。确认主 `.ino` 文件仍位于同名 `MimiVent` 文件夹内。
 3. 连接开发板，选择 `ESP32C3 Dev Module` 和对应 USB 串口。
 4. 点击左上角 **Verify（验证/编译，勾号）**。首次编译会下载/准备 ESP32 构建工具，可能比后续编译花更久；等待输出区出现编译成功信息。
@@ -148,7 +154,7 @@ DCP3512 GND ─────────────── ESP32 GND、PIR GND
 arduino-cli compile --fqbn esp32:esp32:esp32c3 MimiVent
 ```
 
-如使用 CLI，需先安装对应 ESP32 core 和 `Adafruit NeoPixel` 库；串口上传需要把命令中的 FQBN、串口名替换为本机实际值。
+如使用 CLI，需先安装对应 ESP32 core、`Adafruit NeoPixel` 和 `NimBLE-Arduino` 库；串口上传需要把命令中的 FQBN、串口名替换为本机实际值。当前 BLE 固件编译约占默认应用分区 98%，后续添加功能前应先检查分区空间。
 
 ## 首次上电与验证
 
@@ -178,6 +184,16 @@ arduino-cli compile --fqbn esp32:esp32:esp32c3 MimiVent
 
 连接 ESP32 自建热点期间，手机通常无法同时通过该 Wi-Fi 上网；这是 AP 模式的正常表现。当前页面和设备状态只在手机与 ESP32 的本地连接中可用，不提供云端远程访问。
 
+### 蓝牙网页控制（v0.2.0 新增）
+
+BLE 控制复用同一份网页和 `ControlApi` 业务接口：自动感应、状态查看、临时排风/暂停、强制排风测试、持续关闭及正式/DEV 时序读写都走相同的风机状态机和校验逻辑。BLE 服务 UUID 与特征值 UUID 集中在 `AppConfig.h`；协议收发由 `BluetoothManager` 处理。蓝牙断开后设备仍按固件自动流程运行。
+
+**Web Bluetooth 只能从 HTTPS 安全来源调用**，所以设备提供的 `http://192.168.4.1` 页面不能直接作为蓝牙客户端。BLE 网页文件为 `web/index.html`，图标为 `web/favicon.png`；将这两个文件部署到带有效 HTTPS 的静态站点后，在支持 Web Bluetooth 的浏览器打开并点击“连接蓝牙”。页面与设备通过 BLE GATT 通信，不需要先连接 MimiVent 热点；HTTPS/静态 BLE 页面会隐藏本地控制地址和热点凭据，设备热点 HTTP 页面则显示连接所需信息。通过 BLE 不读取 Wi-Fi 密码。若在本地 Wi-Fi 页面点击蓝牙按钮，会提示安全来源限制，Wi-Fi 控制仍可照常使用。
+
+当前浏览器需支持 Web Bluetooth。MDN 将该 API 标记为有限支持且要求安全上下文；正式验证建议先用 Android Chrome。iOS Safari 等不支持 Web Bluetooth 的浏览器不能使用此网页 BLE 客户端。请以目标手机的实际浏览器兼容性为准。[MDN Web Bluetooth 兼容性与安全要求](https://developer.mozilla.org/en-US/docs/Web/API/Web_Bluetooth_API)
+
+修改 `web/index.html` 或 `FaviconAsset.h` 后，运行 `python3 scripts/build_web_asset.py`，它会重新生成固件使用的 gzip 页面资源 `WebDashboardAsset.h`，并同步静态客户端图标。不要直接编辑生成文件。用户已确认静态网页呈现和连接信息显示正常；BLE 曾在 macOS 本地静态页面完成连接和控制。本次 BLE 请求串行修复与非法时序值校验已编译通过，但未在本次更新后重新烧录实机回归。HTTPS 托管页面的目标手机兼容性及断线重连仍需按目标浏览器验证。固件约占默认应用分区 99%，新增固件功能前应关注余量。
+
 控制页面由 `/` 正式运行页和 `/dev` 联调页共用同一套响应式布局。顶部以纯文本显示设备本地地址 `192.168.4.1`；正式页和 DEV 页使用同一个设备 IP，DEV 页通过 `/dev` 路径访问。底部显示当前正式/DEV 配置及切换入口。设备重启后默认使用正式配置；如果浏览器仍停留在 DEV 页，页面会提示页面配置与设备配置不一致，并锁定所有控制及时间设置。此时可确认切换设备到当前页面配置，或直接打开设备当前配置对应的页面。设备端控制和配置写入 API 也会拒绝不匹配页面的请求。切换配置前会弹窗确认；确认后立即停止风机、取消当前排风或暂停任务，并以目标配置的时序重新进入自动感应。页面每秒刷新设备状态、PIR 电平、风机运行时长和当前阶段倒计时，不依赖外部 CDN。
 
 状态卡片同时展示设备当前实际使用环境的五项时序配置，并在启动冷静期、自动离开确认、自动排风、临时排风、临时暂停或强制测试时突出显示本次阶段/操作使用的时长与说明。保存新配置不会改写已开始任务的计时；运行卡片显示该任务启动时实际采用的时长。
@@ -192,7 +208,7 @@ arduino-cli compile --fqbn esp32:esp32:esp32c3 MimiVent
 
 热点名和密码在 `AppConfig.h` 的 `kApSsid`、`kApPassword` 修改。网页底部从固件配置接口读取并显示这两个值；修改配置后重新编译、烧录即可同步更新。ESP32 SoftAP 密码必须至少 8 个字符。
 
-`v0.1.0` 已在 ESP32-C3-DevKitM-1 上完成实机功能验证，包括单 PIR 自动排风、本地网页控制、定时排风与暂停、持续关闭、时序配置和环境切换。双盆风道及第二个 PIR 尚未纳入固件验证范围。
+`v0.1.0` 已在 ESP32-C3-DevKitM-1 上完成实机功能验证，包括单 PIR 自动排风、本地网页控制、定时排风与暂停、持续关闭、时序配置和环境切换。BLE 页面曾通过 macOS 本地静态文件完成连接和网页控制；`v0.2.0` 的请求排队修复及非法时序输入拒绝逻辑已通过编译，但本次更新尚未重新烧录回归。双盆风道及第二个 PIR 尚未纳入固件验证范围。
 
 ## 时序配置
 
@@ -235,7 +251,7 @@ PIR 模块自身输出 HIGH 的保持时间由模块电位器控制；软件离�
 
 ## 版本管理
 
-- 当前正式版本：`v0.1.0`。此前提交均为未纳入版本号管理的硬件和网页调试 demo。
+- 当前版本：`v0.2.0`。`v0.1.0` 完成基础风机与本地网页实机验证；`v0.2.0` 增加 BLE 网页控制及 HTTP/BLE 共用时序输入校验。BLE 兼容性和本次更新后的实机回归范围见上文“验证说明”。此前提交均为未纳入版本号管理的硬件和网页调试 demo。
 - 版本号集中在 `FirmwareVersion.h`，页面和串口启动日志自动读取该版本。
 - 每次迭代在 `CHANGELOG.md` 记录功能变化；准备发布时同步更新版本号并创建 Git tag，例如 `v0.2.0`。
 - 使用 `MAJOR.MINOR.PATCH`：不兼容改动升 MAJOR；新增兼容功能升 MINOR；兼容性修复升 PATCH。
@@ -248,7 +264,7 @@ PIR 模块自身输出 HIGH 的保持时间由模块电位器控制；软件离�
 arduino-cli compile --fqbn esp32:esp32:esp32c3 MimiVent
 ```
 
-依赖：ESP32 Arduino core 自带的 `WiFi`、`WebServer`，以及项目已有的 `Adafruit NeoPixel` 库。
+依赖：ESP32 Arduino core 自带的 `WiFi`、`WebServer`，以及 `Adafruit NeoPixel` 1.15.5、`NimBLE-Arduino` 2.5.1。
 
 本项目用 `.clang-format` 固定 Arduino C++ 的格式风格（Google C++ 基础、2 空格缩进、100 列）。格式化时只处理 `.ino/.h/.cpp`，不要对 `WebDashboard.cpp` 内的 HTML 原始字符串做重写。当前每次修改至少执行 Arduino 编译；页面脚本修改后再用 `node --check` 检查脚本语法，并用 `git diff --check` 检查空白错误。涉及风机模式或计时逻辑时，再补状态转换测试或实机验证。若系统未安装 `clang-format`，格式化检查需先安装对应工具；仅编译通过不代表格式检查已通过。
 

@@ -20,4 +20,10 @@ constexpr char kApPassword[] = "MimiVent";
 constexpr uint8_t kApAddress[] = {192, 168, 4, 1};
 constexpr uint8_t kApSubnet[] = {255, 255, 255, 0};
 
+// BLE GATT 服务标识，网页端用这组 UUID 查找并连接设备。
+constexpr char kBleDeviceName[] = "MimiVent";
+constexpr char kBleServiceUuid[] = "6f9b0001-7d5a-4c3b-9a21-2f6d4d494d49";
+constexpr char kBleCommandUuid[] = "6f9b0002-7d5a-4c3b-9a21-2f6d4d494d49";
+constexpr char kBleResponseUuid[] = "6f9b0003-7d5a-4c3b-9a21-2f6d4d494d49";
+
 }  // namespace AppConfig
