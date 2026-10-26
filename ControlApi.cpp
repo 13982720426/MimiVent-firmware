@@ -2,10 +2,12 @@
 #include "ControlApi.h"
 
 #include <cstdio>
+#include <cstdlib>
 
 #include "AppConfig.h"
 #include "FanController.h"
 #include "FirmwareVersion.h"
+#include "StatisticsStore.h"
 
 namespace {
 
@@ -34,6 +36,19 @@ bool profileMatches(TimingProfile requested) {
 
 bool replacementAllowed(bool replace) {
   return !fanControllerHasInterruptibleTask() || replace;
+}
+
+String formValue(const String& body, const char* key) {
+  const String prefix = String(key) + "=";
+  int start = 0;
+  while (start < body.length()) {
+    const int end = body.indexOf('&', start);
+    const String item = end < 0 ? body.substring(start) : body.substring(start, end);
+    if (item.startsWith(prefix)) return item.substring(prefix.length());
+    if (end < 0) break;
+    start = end + 1;
+  }
+  return String();
 }
 
 ControlApiResponse statusResponse(TimingProfile viewProfile) {
@@ -127,6 +142,27 @@ ControlApiResponse lockOffResponse(const ControlApiRequest& request) {
 
 ControlApiResponse controlApiDispatch(const ControlApiRequest& request) {
   if (request.path == "/api/status" && request.method == "GET") return statusResponse(request.profile);
+  if (request.path == "/api/stats" && request.method == "GET") {
+    const FanControllerStatus status = fanControllerGetStatus(millis());
+    return response(200, "application/json; charset=utf-8",
+                    statisticsStoreBuildJson(request.mode, status.fanOn, status.fanRunMs));
+  }
+  if (request.path == "/api/time" && request.method == "POST") {
+    const String epochText = formValue(request.body, "unixTime");
+    const String offsetText = formValue(request.body, "utcOffsetMinutes");
+    if (!epochText.length() || !offsetText.length()) return jsonError(400, "TIME_REQUIRED");
+    char* end = nullptr;
+    const unsigned long epoch = strtoul(epochText.c_str(), &end, 10);
+    if (end == epochText.c_str() || *end != '\0') return jsonError(400, "INVALID_TIME");
+    const long offset = strtol(offsetText.c_str(), &end, 10);
+    if (end == offsetText.c_str() || *end != '\0' || offset < -720 || offset > 840) {
+      return jsonError(400, "INVALID_TIMEZONE_OFFSET");
+    }
+    if (!statisticsStoreSetClock(epoch, static_cast<int16_t>(offset))) {
+      return jsonError(400, "INVALID_TIME");
+    }
+    return jsonOk("{\"synced\":true}");
+  }
   if (request.path == "/api/settings" && request.method == "GET") return settingsResponse(request.profile);
   if (request.path == "/api/settings" && request.method == "POST") {
     if (!profileMatches(request.profile)) return jsonError(409, "PROFILE_MISMATCH");

@@ -32,6 +32,12 @@ bool buildApiRequest(ControlApiRequest* request, const char** errorMessage) {
   }
   request->mode = server.arg("mode");
   request->stage = server.arg("stage");
+  request->body = server.arg("plain");
+  if (request->path == "/api/time" && request->method == "POST") {
+    // WebServer 会把表单字段解析为 arg；转换成与 BLE 共用的表单体格式。
+    request->body = "unixTime=" + server.arg("unixTime") +
+                    "&utcOffsetMinutes=" + server.arg("utcOffsetMinutes");
+  }
   request->replace = server.arg("replace") == "1";
   request->switchProfile = server.arg("switch") == "1";
   if (request->path == "/api/settings" && request->method == "POST") {
@@ -101,6 +107,8 @@ void webDashboardBegin() {
   server.on("/dev/", HTTP_GET, handleRoot);
   server.on("/favicon.png", HTTP_GET, handleFavicon);
   server.on("/api/status", HTTP_GET, handleApiRequest);
+  server.on("/api/stats", HTTP_GET, handleApiRequest);
+  server.on("/api/time", HTTP_POST, handleApiRequest);
   server.on("/api/settings", HTTP_GET, handleApiRequest);
   server.on("/api/settings", HTTP_POST, handleApiRequest);
   server.on("/api/settings/reset", HTTP_POST, handleApiRequest);

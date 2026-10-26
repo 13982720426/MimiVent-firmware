@@ -2,6 +2,7 @@
 #include "FanController.h"
 
 #include "AppConfig.h"
+#include "StatisticsStore.h"
 
 namespace {
 
@@ -24,6 +25,14 @@ uint8_t relayOffLevel() { return AppConfig::kRelayActiveLow ? HIGH : LOW; }
 
 void setFan(bool turnOn, unsigned long nowMs) {
   if (fanOn == turnOn) return;
+  if (turnOn) {
+    uint8_t kind = 3;  // 临时排风
+    if (controlMode == ControlMode::AUTO && autoPhase == AutoPhase::EXHAUSTING) kind = 2;
+    else if (controlMode == ControlMode::FORCE_TEST) kind = 4;
+    statisticsStoreFanStarted(kind, nowMs);
+  } else {
+    statisticsStoreFanStopped(nowMs - fanStartedMs);
+  }
   fanOn = turnOn;
   fanStartedMs = fanOn ? nowMs : 0;
   digitalWrite(AppConfig::kRelayPin, fanOn ? relayOnLevel() : relayOffLevel());
@@ -91,6 +100,7 @@ void updatePresence(unsigned long nowMs) {
 
   previousPresenceDetected = presenceDetected;
   Serial.printf("[%lu ms] PIR: %s\n", nowMs, presenceDetected ? "HIGH" : "LOW");
+  if (presenceDetected) statisticsStoreRecordActivity();
 
   // 启动冷静期只记录 PIR 当前电平，不推进自动排风状态。
   if (controlMode == ControlMode::AUTO && autoPhase == AutoPhase::STARTUP_COOLDOWN) return;

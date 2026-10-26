@@ -1,6 +1,6 @@
 # MimiVent
 
-ESP32-C3-DevKitM-1 单猫砂盆自动排风固件，包含本地手机网页控制台和 BLE 网页控制。当前基础方案使用 **1 个猫砂盆、1 个 PIR、1 台风机**；设备开机后先执行启动冷静期，再进入 PIR 自动感应。手机页面可查看 PIR/风机状态，临时强制开/关均可设定时长，另有需要二次确认的持续关闭锁。三通、第二段支管和第二个 PIR 是连接第二个猫砂盆时才需要的可选扩展，不属于当前基础方案的必需配件。当前固件版本为 `v0.2.0`。
+ESP32-C3-DevKitM-1 单猫砂盆自动排风固件，包含本地手机网页控制台和 BLE 网页控制。当前基础方案使用 **1 个猫砂盆、1 个 PIR、1 台风机**；设备开机后先执行启动冷静期，再进入 PIR 自动感应。手机页面可查看 PIR/风机状态，临时强制开/关均可设定时长，另有需要二次确认的持续关闭锁。三通、第二段支管和第二个 PIR 是连接第二个猫砂盆时才需要的可选扩展，不属于当前基础方案的必需配件。当前正式固件版本为 `v0.3.0`。
 
 ## 项目启动前准备
 
@@ -34,7 +34,7 @@ ESP32-C3-DevKitM-1 单猫砂盆自动排风固件，包含本地手机网页控�
 - macOS、Windows 或 Linux 均可开发；Arduino IDE 2.x 可用于编辑、编译和烧录。本项目不要求 Windows。
 - 需要安装的软件：Arduino IDE 2.x、Espressif Systems 的 `esp32` 板卡包、`Adafruit NeoPixel` 库、`NimBLE-Arduino` 库。
 - `WiFi`、`WebServer` 和 `Preferences`（NVS 配置存储）库由 ESP32 Arduino core 自带，不要在 Library Manager 里另外安装同名库。
-- 当前构建组合：Arduino IDE 2.3.10、ESP32 Arduino core `esp32:esp32` 3.3.12、Adafruit NeoPixel 1.15.5、NimBLE-Arduino 2.5.1。Wi-Fi 自动排风版本已实机验证；BLE 版本目前只完成编译，仍需实机验证。
+- 当前构建组合：Arduino IDE 2.3.10、ESP32 Arduino core `esp32:esp32` 3.3.12、Adafruit NeoPixel 1.15.5、NimBLE-Arduino 2.5.1。v0.3.0 已完成编译和 USB 烧录；统计跨重启恢复及 BLE 长时间连接仍建议按回归清单实测。
 - 将本仓库整个项目目录放在 Arduino sketchbook 下，保持目录名和主 `.ino` 文件名一致：`MimiVent/MimiVent.ino`。
 - 首次接线烧录时使用 USB 数据线连接开发板；在 IDE 中选择对应串口和 `ESP32C3 Dev Module` 板卡配置。
 
@@ -68,7 +68,7 @@ ESP32-C3-DevKitM-1 单猫砂盆自动排风固件，包含本地手机网页控�
 1. 用 USB 数据线连接 ESP32-C3-DevKitM-1。
 2. 从 IDE 顶部的开发板选择器中选择 **ESP32C3 Dev Module**。如果列表中没有该选项，先确认 Espressif `esp32` 板卡包已经安装完成。
 3. 在 **Tools（工具）** 菜单确认板型为 `ESP32C3 Dev Module`，选择开发板插入后出现的 **Port（端口）**。端口名称因操作系统和 USB 转串口芯片而异；不确定时可拔插开发板，观察哪个端口随之消失/出现。
-4. 本项目使用板载默认 4MB Flash。若工具菜单显示 **Flash Size（闪存大小）**，选择 `4MB (32Mb)`；其他选项保持该板型默认值即可。
+4. 本项目使用板载 4MB Flash。**Partition Scheme（分区方案）必须选择 `Minimal SPIFFS (1.9MB APP with OTA/128KB SPIFFS)`**，否则统计数据区或 OTA 应用槽可能不可用。若工具菜单显示 **Flash Size（闪存大小）**，选择 `4MB (32Mb)`。
 
 ### 接线前安全检查
 
@@ -151,10 +151,24 @@ DCP3512 GND ─────────────── ESP32 GND、PIR GND
 也可使用 Arduino CLI 编译：
 
 ```sh
-arduino-cli compile --fqbn esp32:esp32:esp32c3 MimiVent
+arduino-cli compile --fqbn esp32:esp32:esp32c3:PartitionScheme=min_spiffs MimiVent
 ```
 
-如使用 CLI，需先安装对应 ESP32 core、`Adafruit NeoPixel` 和 `NimBLE-Arduino` 库；串口上传需要把命令中的 FQBN、串口名替换为本机实际值。当前 BLE 固件编译约占默认应用分区 98%，后续添加功能前应先检查分区空间。
+如使用 CLI，需先安装对应 ESP32 core、`Adafruit NeoPixel` 和 `NimBLE-Arduino` 库；串口上传需使用同一 FQBN 并把端口替换为本机实际值，例如：
+
+```sh
+arduino-cli upload --fqbn esp32:esp32:esp32c3:PartitionScheme=min_spiffs --port /dev/cu.usbmodemXXXX MimiVent
+```
+
+当前统计版编译占用约 1.34 MB，应用分区为 1.875 MiB；双 OTA 槽仍可用，SPIFFS 统计区为 128 KiB。升级分区布局后首次启动会初始化统计文件系统；不要改回默认分区，否则 OTA 和统计文件布局不再匹配。
+
+## 统计数据与同步
+
+- App 每次 BLE 连接后会把手机 Unix 时间和本地 UTC 偏移发送到设备。ESP32-C3 没有后备电池时钟；若本次开机期间尚未校时，事件会先以开机计时暂存，并在首次校时后回填。若在校时前再次断电，无法从设备本身还原这段时间对应的自然日，因此这些未校时事件不会计入日期统计。
+- PIR 活动沿、风机启动/停止等事件在发生时写入 SPIFFS 双槽快照；风机运行期间不会每秒写闪存。`/api/status` 可实时提供本轮运行时长，统计页约每 1 分钟刷新并显示进行中的运行时间；结束时保存最终时长和事件状态。
+- 每日汇总最多保留 365 天，事件明细最多保留 30 天（上限 512 条）；设备异常重启时，未完成的运行记录会标记为中断。
+- API：`POST /api/time` 校准手机时间，`GET /api/stats?mode=today|yesterday|threeDays|sevenDays` 读取汇总、时段桶和当日最近事件。BLE 与 HTTP 共用同一统计 API。
+- 统计数据保存在 SPIFFS（128 KiB），配置仍保存在 NVS。首次初始化空分区时会格式化并写入 NVS 初始化标记；已初始化过的分区若挂载失败，固件会禁用统计并保留分区现场，不会自动格式化历史数据。若需要手动恢复，应先备份统计分区，再执行明确的格式化操作。
 
 ## 首次上电与验证
 
@@ -177,7 +191,7 @@ arduino-cli compile --fqbn esp32:esp32:esp32c3 MimiVent
 
 本版使用 ESP32 自建 Wi-Fi 热点（AP），不依赖路由器和外网，也没有额外网页库依赖。页眉 Logo 以内嵌 data URI 显示，标签图标通过 `/favicon.png` 提供，图标数据保存在 `FaviconAsset.h`。
 
-1. Arduino IDE 选择 `ESP32C3 Dev Module`，Flash Size 设为 `4MB (32Mb)`，Partition Scheme 设为 `Default 4MB with spiffs`。
+1. Arduino IDE 选择 `ESP32C3 Dev Module`，Flash Size 设为 `4MB (32Mb)`，Partition Scheme 设为 `Minimal SPIFFS (1.9MB APP with OTA/128KB SPIFFS)`。
 2. 上传项目目录中的 `MimiVent.ino`。
 3. 手机连接 Wi-Fi：`MimiVent`，密码：`MimiVent`。
 4. 浏览器访问 `http://192.168.4.1`。
@@ -192,7 +206,7 @@ BLE 控制复用同一份网页和 `ControlApi` 业务接口：自动感应、�
 
 当前浏览器需支持 Web Bluetooth。MDN 将该 API 标记为有限支持且要求安全上下文；正式验证建议先用 Android Chrome。iOS Safari 等不支持 Web Bluetooth 的浏览器不能使用此网页 BLE 客户端。请以目标手机的实际浏览器兼容性为准。[MDN Web Bluetooth 兼容性与安全要求](https://developer.mozilla.org/en-US/docs/Web/API/Web_Bluetooth_API)
 
-修改 `web/index.html` 或 `FaviconAsset.h` 后，运行 `python3 scripts/build_web_asset.py`，它会重新生成固件使用的 gzip 页面资源 `WebDashboardAsset.h`，并同步静态客户端图标。不要直接编辑生成文件。用户已确认静态网页呈现和连接信息显示正常；BLE 曾在 macOS 本地静态页面完成连接和控制。本次 BLE 请求串行修复与非法时序值校验已编译通过，但未在本次更新后重新烧录实机回归。HTTPS 托管页面的目标手机兼容性及断线重连仍需按目标浏览器验证。固件约占默认应用分区 99%，新增固件功能前应关注余量。
+修改 `web/index.html` 或 `FaviconAsset.h` 后，运行 `python3 scripts/build_web_asset.py`，它会重新生成固件使用的 gzip 页面资源 `WebDashboardAsset.h`，并同步静态客户端图标。不要直接编辑生成文件。用户已确认静态网页呈现和连接信息显示正常；BLE 曾在 macOS 本地静态页面完成连接和控制。本次 BLE 分包及统计改动已使用 `Minimal SPIFFS` 分区编译通过，但尚未重新烧录并完成实机回归；目标手机上的连续 BLE 稳定性、统计累计与重连恢复需要在烧录后验证。当前统计版固件占 1.9 MiB 应用槽约 68%，并保留双 OTA 槽。
 
 控制页面由 `/` 正式运行页和 `/dev` 联调页共用同一套响应式布局。顶部以纯文本显示设备本地地址 `192.168.4.1`；正式页和 DEV 页使用同一个设备 IP，DEV 页通过 `/dev` 路径访问。底部显示当前正式/DEV 配置及切换入口。设备重启后默认使用正式配置；如果浏览器仍停留在 DEV 页，页面会提示页面配置与设备配置不一致，并锁定所有控制及时间设置。此时可确认切换设备到当前页面配置，或直接打开设备当前配置对应的页面。设备端控制和配置写入 API 也会拒绝不匹配页面的请求。切换配置前会弹窗确认；确认后立即停止风机、取消当前排风或暂停任务，并以目标配置的时序重新进入自动感应。页面每秒刷新设备状态、PIR 电平、风机运行时长和当前阶段倒计时，不依赖外部 CDN。
 
@@ -251,7 +265,7 @@ PIR 模块自身输出 HIGH 的保持时间由模块电位器控制；软件离�
 
 ## 版本管理
 
-- 当前版本：`v0.2.0`。`v0.1.0` 完成基础风机与本地网页实机验证；`v0.2.0` 增加 BLE 网页控制及 HTTP/BLE 共用时序输入校验。BLE 兼容性和本次更新后的实机回归范围见上文“验证说明”。此前提交均为未纳入版本号管理的硬件和网页调试 demo。
+- 当前正式版本：`v0.3.0`。`v0.1.0` 完成基础风机与本地网页实机验证；`v0.2.0` 增加 BLE 网页控制及 HTTP/BLE 共用时序输入校验；`v0.3.0` 增加设备统计、时间回填及 SPIFFS 数据保护。统计跨重启恢复和 BLE 长时间连接的回归结果请结合目标设备验证。此前提交均为未纳入版本号管理的硬件和网页调试 demo。
 - 版本号集中在 `FirmwareVersion.h`，页面和串口启动日志自动读取该版本。
 - 每次迭代在 `CHANGELOG.md` 记录功能变化；准备发布时同步更新版本号并创建 Git tag，例如 `v0.2.0`。
 - 使用 `MAJOR.MINOR.PATCH`：不兼容改动升 MAJOR；新增兼容功能升 MINOR；兼容性修复升 PATCH。

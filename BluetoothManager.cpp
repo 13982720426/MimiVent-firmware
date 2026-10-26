@@ -13,7 +13,9 @@ namespace {
 
 constexpr size_t kRequestBufferSize = 384;
 constexpr size_t kResponseChunkSize = 18;  // 保持兼容默认 23 字节 ATT MTU。
-constexpr unsigned long kResponseChunkIntervalMs = 8UL;
+// 慢速分片并冗余重发末片，降低 Wi-Fi/BLE 共存时丢失结束符导致整笔请求超时的概率。
+constexpr unsigned long kResponseChunkIntervalMs = 20UL;
+constexpr uint8_t kFinalChunkRepeatCount = 2;
 
 NimBLEServer* bleServer = nullptr;
 NimBLECharacteristic* responseCharacteristic = nullptr;
@@ -25,6 +27,9 @@ bool requestPending = false;
 String queuedResponse;
 size_t queuedResponseOffset = 0;
 unsigned long lastResponseChunkMs = 0;
+String finalResponseChunk;
+uint8_t finalChunkRepeatsRemaining = 0;
+uint16_t queuedResponseChunkCount = 0;
 
 String fieldAt(const String& packet, uint8_t wantedIndex, uint8_t* nextOffset) {
   uint8_t start = 0;
@@ -62,6 +67,7 @@ bool parsePacket(const String& packet, ControlApiRequest* request) {
   request->replace = fieldAt(packet, 5, &offset) == "1";
   request->switchProfile = fieldAt(packet, 6, &offset) == "1";
   const String body = packet.substring(offset);
+  request->body = body;
 
   if (request->method != "GET" && request->method != "POST") return false;
   if (!settingsStoreParseProfile(profile, &request->profile)) return false;
@@ -88,27 +94,55 @@ bool parsePacket(const String& packet, ControlApiRequest* request) {
 void queueResponse(const ControlApiResponse& response) {
   queuedResponse = String(response.statusCode) + '\n' + response.body + '\n';
   queuedResponseOffset = 0;
+  finalResponseChunk = "";
+  finalChunkRepeatsRemaining = 0;
+  queuedResponseChunkCount = 0;
 }
 
 void sendNextResponseChunk(unsigned long nowMs) {
-  if (!clientConnected || !queuedResponse.length()) return;
+  if (!clientConnected || (!queuedResponse.length() && !finalChunkRepeatsRemaining)) return;
   if (queuedResponseOffset && nowMs - lastResponseChunkMs < kResponseChunkIntervalMs) return;
+
+  if (queuedResponseOffset >= queuedResponse.length()) {
+    if (finalChunkRepeatsRemaining && finalResponseChunk.length()) {
+      responseCharacteristic->setValue(finalResponseChunk.c_str());
+      if (!responseCharacteristic->notify()) return;
+      --finalChunkRepeatsRemaining;
+      lastResponseChunkMs = nowMs;
+      if (!finalChunkRepeatsRemaining) {
+        Serial.printf("BLE response sent: %u chunks, %u bytes (tail repeated)\n",
+                      queuedResponseChunkCount,
+                      static_cast<unsigned>(queuedResponse.length()));
+        queuedResponse = "";
+        queuedResponseOffset = 0;
+        finalResponseChunk = "";
+      }
+    }
+    return;
+  }
 
   const String chunk = queuedResponse.substring(queuedResponseOffset,
                                                 queuedResponseOffset + kResponseChunkSize);
   responseCharacteristic->setValue(chunk.c_str());
   if (!responseCharacteristic->notify()) return;
   queuedResponseOffset += chunk.length();
+  ++queuedResponseChunkCount;
   lastResponseChunkMs = nowMs;
   if (queuedResponseOffset >= queuedResponse.length()) {
-    queuedResponse = "";
-    queuedResponseOffset = 0;
+    finalResponseChunk = chunk;
+    finalChunkRepeatsRemaining = kFinalChunkRepeatCount;
   }
 }
 
 class ServerCallbacks final : public NimBLEServerCallbacks {
-  void onConnect(NimBLEServer*, NimBLEConnInfo&) override { clientConnected = true; }
-  void onDisconnect(NimBLEServer*, NimBLEConnInfo&, int) override { clientConnected = false; }
+  void onConnect(NimBLEServer*, NimBLEConnInfo&) override {
+    clientConnected = true;
+    Serial.println("BLE client connected");
+  }
+  void onDisconnect(NimBLEServer*, NimBLEConnInfo&, int reason) override {
+    clientConnected = false;
+    Serial.printf("BLE client disconnected; reason=0x%02X\n", reason);
+  }
 };
 
 class CommandCallbacks final : public NimBLECharacteristicCallbacks {
@@ -158,6 +192,8 @@ void bluetoothManagerUpdate() {
     wasClientConnected = false;
     queuedResponse = "";
     queuedResponseOffset = 0;
+    finalResponseChunk = "";
+    finalChunkRepeatsRemaining = 0;
   } else if (clientConnected && !wasClientConnected) {
     wasClientConnected = true;
   }

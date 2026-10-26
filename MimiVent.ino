@@ -16,6 +16,7 @@
 #include "FirmwareVersion.h"
 #include "StatusLed.h"
 #include "SettingsStore.h"
+#include "StatisticsStore.h"
 #include "WebDashboard.h"
 #include "WifiManager.h"
 
@@ -23,7 +24,9 @@ void setup() {
   Serial.begin(115200);
 
   settingsStoreBegin();
+  // 先把继电器输出设为关闭，避免 SPIFFS 挂载/校验期间继电器输入悬空。
   fanControllerBegin();
+  statisticsStoreBegin();
   statusLedBegin();
 
   const bool accessPointStarted = wifiManagerBegin();

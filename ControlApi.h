@@ -12,6 +12,7 @@ struct ControlApiRequest {
   TimingProfile profile = TimingProfile::PRODUCTION;
   String mode;
   String stage;
+  String body;
   bool replace = false;
   bool switchProfile = false;
   bool hasSettings = false;
