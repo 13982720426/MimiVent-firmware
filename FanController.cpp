@@ -290,6 +290,7 @@ void fanControllerStartTimedPause(unsigned long durationMs, unsigned long nowMs)
   overrideStartedMs = nowMs;
   overrideDurationMs = durationMs;
   setFan(false, nowMs);
+  statisticsStoreRecordTimedPause(durationMs);
   Serial.printf("Timed pause started for %lu ms\n", durationMs);
 }
 
@@ -303,6 +304,9 @@ void fanControllerStartForceTest(unsigned long durationMs, unsigned long nowMs) 
 }
 
 void fanControllerSetAuto(unsigned long nowMs) {
+  if (controlMode == ControlMode::LOCKED_OFF || controlMode == ControlMode::TIMED_OFF) {
+    statisticsStoreRecordAutoResume();
+  }
   controlMode = ControlMode::AUTO;
   overrideDurationMs = 0;
   setFan(false, nowMs);
@@ -321,6 +325,7 @@ void fanControllerSetLockedOff(unsigned long nowMs) {
   controlMode = ControlMode::LOCKED_OFF;
   overrideDurationMs = 0;
   setFan(false, nowMs);
+  statisticsStoreRecordLockedOff();
   Serial.println("Control mode: locked off");
 }
 

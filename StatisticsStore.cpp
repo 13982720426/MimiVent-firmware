@@ -24,7 +24,15 @@ constexpr char kFilesystemReadyKey[] = "statsfs";
 constexpr char kSlotA[] = "/stats-a.bin";
 constexpr char kSlotB[] = "/stats-b.bin";
 
-enum : uint8_t { kActivity = 1, kAutomatic = 2, kManual = 3, kForce = 4 };
+enum : uint8_t {
+  kActivity = 1,
+  kAutomatic = 2,
+  kManual = 3,
+  kForce = 4,
+  kPause = 5,
+  kLockedOff = 6,
+  kAutoResume = 7
+};
 enum : uint8_t { kActive = 1, kComplete = 2, kInterrupted = 3 };
 
 struct DailyRecord {
@@ -287,7 +295,11 @@ const char* kindName(uint8_t kind) {
     case kActivity: return "activity";
     case kAutomatic: return "automatic";
     case kManual: return "manual";
-    default: return "force";
+    case kForce: return "force";
+    case kPause: return "pause";
+    case kLockedOff: return "locked_off";
+    case kAutoResume: return "resume";
+    default: return "unknown";
   }
 }
 
@@ -388,6 +400,24 @@ void statisticsStoreRecordActivity() {
   addEvent(kActivity, kComplete);
 }
 
+void statisticsStoreRecordTimedPause(unsigned long durationMs) {
+  if (!ready) return;
+  // 暂停事件记录设定时长；任务可被提前替换，因此这是用户设置的时长。
+  addEvent(kPause, kComplete, durationMs / 1000UL);
+}
+
+void statisticsStoreRecordLockedOff() {
+  if (!ready) return;
+  // 持续关闭没有预设结束时间，事件中以 0 表示不限时。
+  addEvent(kLockedOff, kComplete);
+}
+
+void statisticsStoreRecordAutoResume() {
+  if (!ready) return;
+  // 为持续关闭写入明确的结束事件，App 据此计算真实关闭时长。
+  addEvent(kAutoResume, kComplete);
+}
+
 void statisticsStoreFanStarted(uint8_t kind, unsigned long nowMs) {
   if (!ready || kind == kActivity) return;
   (void)nowMs;
@@ -408,7 +438,8 @@ void statisticsStoreFanStopped(unsigned long durationMs) {
   persist();
 }
 
-String statisticsStoreBuildJson(const String& range, bool fanOn, unsigned long activeRunMs) {
+String statisticsStoreBuildJson(const String& range, bool fanOn, unsigned long activeRunMs,
+                                uint16_t eventOffset) {
   const uint32_t now = currentEpoch();
   const int64_t signedOffsetSeconds = static_cast<int32_t>(timezoneOffsetMinutes) * 60;
   const int64_t localNow = now ? static_cast<int64_t>(now) + signedOffsetSeconds : 0;
@@ -427,6 +458,7 @@ String statisticsStoreBuildJson(const String& range, bool fanOn, unsigned long a
   uint32_t automaticCount = 0;
   uint32_t buckets[24]{};
   String eventsJson = "[";
+  uint16_t eventTotal = 0;
   uint8_t recentCount = 0;
 
   for (size_t i = 0; i < dailyCount; ++i) {
@@ -466,15 +498,23 @@ String statisticsStoreBuildJson(const String& range, bool fanOn, unsigned long a
     const uint32_t bucket = dayIndex * (24 / bucketSpanHours) + parts.tm_hour / bucketSpanHours;
     if (bucket < bucketCount && current.kind != kActivity) buckets[bucket] += activeRunMs / 1000UL;
   }
-  if (range == "today") {
-    for (int i = static_cast<int>(eventCount) - 1; i >= 0 && recentCount < 8; --i) {
+  if (range == "today" || range == "yesterday") {
+    // 今日按滚动 24 小时查询；昨日按本地自然日查询，由 mode 参数决定窗口。
+    const uint32_t eventStart = range == "today"
+        ? (now > kSecondsPerDay ? now - kSecondsPerDay : 0)
+        : periodStart;
+    const uint32_t eventEnd = range == "today" ? now + 1 : todayStart;
+    for (int i = static_cast<int>(eventCount) - 1; i >= 0; --i) {
       if (!now) break;
       EventRecord event = events[i];
       if (event.state == kActive && static_cast<size_t>(i) == activeEventIndex) event.durationSeconds = activeRunMs / 1000UL;
-      if (!eventInRange(event, periodStart, now + 1)) continue;
-      if (recentCount++) eventsJson += ',';
-      eventsJson += "{\"time\":" + String(event.unixSeconds) + ",\"kind\":\"" + kindName(event.kind) +
-                    "\",\"state\":\"" + stateName(event.state) + "\",\"durationSeconds\":" + String(event.durationSeconds) + "}";
+      if (!eventInRange(event, eventStart, eventEnd)) continue;
+      if (eventTotal >= eventOffset && recentCount < 32) {
+        if (recentCount++) eventsJson += ',';
+        eventsJson += "{\"time\":" + String(event.unixSeconds) + ",\"kind\":\"" + kindName(event.kind) +
+                      "\",\"state\":\"" + stateName(event.state) + "\",\"durationSeconds\":" + String(event.durationSeconds) + "}";
+      }
+      if (eventTotal < 0xFFFF) ++eventTotal;
     }
   }
   eventsJson += ']';
@@ -484,8 +524,13 @@ String statisticsStoreBuildJson(const String& range, bool fanOn, unsigned long a
       ",\"activityCount\":" + String(activityCount) + ",\"automaticCount\":" + String(automaticCount) + ",\"bucketSeconds\":[";
   for (uint8_t i = 0; i < bucketCount; ++i) { if (i) json += ','; json += String(buckets[i]); }
   json += "],\"events\":" + eventsJson;
+  const bool eventsHasMore = static_cast<uint32_t>(eventOffset) + recentCount < eventTotal;
+  json += ",\"eventsOffset\":" + String(eventOffset) +
+          ",\"eventsNextOffset\":" + String(eventOffset + recentCount) +
+          ",\"eventsTotal\":" + String(eventTotal) +
+          ",\"eventsHasMore\":" + String(eventsHasMore ? "true" : "false");
   // 昨日页同样需要一条按日汇总，供 App 展示日期、活动次数与总运行时长。
-  if (range != "today") {
+  if (range == "threeDays" || range == "sevenDays") {
     json += ",\"days\":[";
     for (uint8_t dayIndex = 0; dayIndex < daySpan; ++dayIndex) {
       if (dayIndex) json += ',';
@@ -502,5 +547,41 @@ String statisticsStoreBuildJson(const String& range, bool fanOn, unsigned long a
     json += ']';
   }
   json += '}';
+  return json;
+}
+
+String statisticsStoreBuildEventsJson(uint32_t start, uint32_t end, const String& kind,
+                                      uint16_t offset, uint8_t limit,
+                                      unsigned long activeRunMs) {
+  String eventsJson = "[";
+  uint16_t total = 0;
+  uint8_t count = 0;
+  for (int i = static_cast<int>(eventCount) - 1; i >= 0; --i) {
+    if (!clockReady) break;
+    EventRecord event = events[i];
+    if (!eventInRange(event, start, end)) continue;
+    const String eventKind = kindName(event.kind);
+    if (kind != "all" && kind != eventKind) continue;
+    if (event.state == kActive && static_cast<size_t>(i) == activeEventIndex) {
+      event.durationSeconds = activeRunMs / 1000UL;
+    }
+    if (total >= offset && count < limit) {
+      if (count++) eventsJson += ',';
+      eventsJson += "{\"time\":" + String(event.unixSeconds) +
+                    ",\"kind\":\"" + eventKind +
+                    "\",\"state\":\"" + stateName(event.state) +
+                    "\",\"durationSeconds\":" + String(event.durationSeconds) + "}";
+    }
+    if (total < 0xFFFF) ++total;
+  }
+  eventsJson += ']';
+  const uint16_t nextOffset = offset + count;
+  const bool hasMore = nextOffset < total;
+  String json = "{\"start\":" + String(start) + ",\"end\":" + String(end) +
+                ",\"kind\":\"" + kind + "\",\"events\":" + eventsJson +
+                ",\"offset\":" + String(offset) +
+                ",\"nextOffset\":" + String(nextOffset) +
+                ",\"total\":" + String(total) +
+                ",\"hasMore\":" + String(hasMore ? "true" : "false") + "}";
   return json;
 }

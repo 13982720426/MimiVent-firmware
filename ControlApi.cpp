@@ -38,6 +38,15 @@ bool replacementAllowed(bool replace) {
   return !fanControllerHasInterruptibleTask() || replace;
 }
 
+bool parseUnsignedParameter(const String& value, unsigned long* parsed) {
+  if (!value.length()) return false;
+  char* end = nullptr;
+  const unsigned long result = strtoul(value.c_str(), &end, 10);
+  if (end == value.c_str() || *end != '\0') return false;
+  *parsed = result;
+  return true;
+}
+
 String formValue(const String& body, const char* key) {
   const String prefix = String(key) + "=";
   int start = 0;
@@ -54,18 +63,18 @@ String formValue(const String& body, const char* key) {
 ControlApiResponse statusResponse(TimingProfile viewProfile) {
   const FanControllerStatus status = fanControllerGetStatus(millis());
   const TimingSettings active = settingsStoreGet(status.activeProfile);
-  char payload[620];
+  char payload[680];
   snprintf(payload, sizeof(payload),
            "{\"fan\":%s,\"pir\":%s,\"mode\":\"%s\",\"phase\":\"%s\","
            "\"activeProfile\":\"%s\",\"viewProfile\":\"%s\",\"fanRunMs\":%lu,"
            "\"remainingMs\":%lu,\"durationMs\":%lu,\"phaseDurationMs\":%lu,\"startupCooldownMs\":%lu,\"leaveConfirmMs\":%lu,"
-           "\"autoExhaustMs\":%lu,\"manualExhaustMs\":%lu,\"pauseMs\":%lu,\"firmware\":\"%s\"}",
+           "\"autoExhaustMs\":%lu,\"manualExhaustMs\":%lu,\"pauseMs\":%lu,\"firmware\":\"%s\",\"minimumAppVersion\":\"%s\"}",
            status.fanOn ? "true" : "false", status.presenceDetected ? "true" : "false",
            fanControllerModeName(), fanControllerPhaseName(),
            settingsStoreProfileName(status.activeProfile), settingsStoreProfileName(viewProfile),
            status.fanRunMs, status.remainingMs, status.overrideDurationMs, status.phaseDurationMs,
            active.startupCooldownMs, active.leaveConfirmMs, active.autoExhaustMs,
-           active.manualExhaustMs, active.pauseMs, FIRMWARE_VERSION);
+           active.manualExhaustMs, active.pauseMs, FIRMWARE_VERSION, FIRMWARE_MINIMUM_APP_VERSION);
   return response(200, "application/json; charset=utf-8", payload);
 }
 
@@ -142,10 +151,50 @@ ControlApiResponse lockOffResponse(const ControlApiRequest& request) {
 
 ControlApiResponse controlApiDispatch(const ControlApiRequest& request) {
   if (request.path == "/api/status" && request.method == "GET") return statusResponse(request.profile);
-  if (request.path == "/api/stats" && request.method == "GET") {
+  if (request.path == "/api/events" && request.method == "GET") {
+    unsigned long start = 0;
+    unsigned long end = 0;
+    unsigned long offset = 0;
+    unsigned long limit = 32;
+    if (!parseUnsignedParameter(request.eventStart, &start) ||
+        !parseUnsignedParameter(request.eventEnd, &end) || start >= end ||
+        end > 0xFFFFFFFFUL) {
+      return jsonError(400, "INVALID_EVENT_RANGE");
+    }
+    if (request.eventOffset.length() &&
+        (!parseUnsignedParameter(request.eventOffset, &offset) || offset > 512UL)) {
+      return jsonError(400, "INVALID_EVENT_OFFSET");
+    }
+    if (request.eventLimit.length() &&
+        (!parseUnsignedParameter(request.eventLimit, &limit) || limit < 1 || limit > 32)) {
+      return jsonError(400, "INVALID_EVENT_LIMIT");
+    }
+    const String kind = request.eventKind.length() ? request.eventKind : "all";
+    if (kind != "all" && kind != "activity" && kind != "automatic" &&
+        kind != "manual" && kind != "force" && kind != "pause" &&
+        kind != "locked_off" && kind != "resume") {
+      return jsonError(400, "INVALID_EVENT_KIND");
+    }
     const FanControllerStatus status = fanControllerGetStatus(millis());
     return response(200, "application/json; charset=utf-8",
-                    statisticsStoreBuildJson(request.mode, status.fanOn, status.fanRunMs));
+                    statisticsStoreBuildEventsJson(
+                        static_cast<uint32_t>(start), static_cast<uint32_t>(end), kind,
+                        static_cast<uint16_t>(offset), static_cast<uint8_t>(limit),
+                        status.fanRunMs));
+  }
+  if (request.path == "/api/stats" && request.method == "GET") {
+    const FanControllerStatus status = fanControllerGetStatus(millis());
+    unsigned long eventOffset = 0;
+    if (request.eventOffset.length()) {
+      char* end = nullptr;
+      eventOffset = strtoul(request.eventOffset.c_str(), &end, 10);
+      if (end == request.eventOffset.c_str() || *end != '\0' || eventOffset > 512UL) {
+        return jsonError(400, "INVALID_EVENT_OFFSET");
+      }
+    }
+    return response(200, "application/json; charset=utf-8",
+                    statisticsStoreBuildJson(request.mode, status.fanOn, status.fanRunMs,
+                                             static_cast<uint16_t>(eventOffset)));
   }
   if (request.path == "/api/time" && request.method == "POST") {
     const String epochText = formValue(request.body, "unixTime");

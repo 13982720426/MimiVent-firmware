@@ -1,6 +1,6 @@
 # MimiVent
 
-ESP32-C3-DevKitM-1 单猫砂盆自动排风固件，包含本地手机网页控制台和 BLE 网页控制。当前基础方案使用 **1 个猫砂盆、1 个 PIR、1 台风机**；设备开机后先执行启动冷静期，再进入 PIR 自动感应。手机页面可查看 PIR/风机状态，临时强制开/关均可设定时长，另有需要二次确认的持续关闭锁。三通、第二段支管和第二个 PIR 是连接第二个猫砂盆时才需要的可选扩展，不属于当前基础方案的必需配件。当前正式固件版本为 `v0.3.0`。
+ESP32-C3-DevKitM-1 单猫砂盆自动排风固件，包含本地手机网页控制台和 BLE 网页控制。当前基础方案使用 **1 个猫砂盆、1 个 PIR、1 台风机**；设备开机后先执行启动冷静期，再进入 PIR 自动感应。手机页面可查看 PIR/风机状态，临时强制开/关均可设定时长，另有需要二次确认的持续关闭锁。三通、第二段支管和第二个 PIR 是连接第二个猫砂盆时才需要的可选扩展，不属于当前基础方案的必需配件。当前正式固件版本为 `v0.3.1`。
 
 ## 项目启动前准备
 
@@ -34,7 +34,7 @@ ESP32-C3-DevKitM-1 单猫砂盆自动排风固件，包含本地手机网页控�
 - macOS、Windows 或 Linux 均可开发；Arduino IDE 2.x 可用于编辑、编译和烧录。本项目不要求 Windows。
 - 需要安装的软件：Arduino IDE 2.x、Espressif Systems 的 `esp32` 板卡包、`Adafruit NeoPixel` 库、`NimBLE-Arduino` 库。
 - `WiFi`、`WebServer` 和 `Preferences`（NVS 配置存储）库由 ESP32 Arduino core 自带，不要在 Library Manager 里另外安装同名库。
-- 当前构建组合：Arduino IDE 2.3.10、ESP32 Arduino core `esp32:esp32` 3.3.12、Adafruit NeoPixel 1.15.5、NimBLE-Arduino 2.5.1。v0.3.0 已完成编译和 USB 烧录；统计跨重启恢复及 BLE 长时间连接仍建议按回归清单实测。
+- 当前构建组合：Arduino IDE 2.3.10、ESP32 Arduino core `esp32:esp32` 3.3.12、Adafruit NeoPixel 1.15.5、NimBLE-Arduino 2.5.1。v0.3.1 已完成编译和 USB 烧录，并由用户验证主要功能。
 - 将本仓库整个项目目录放在 Arduino sketchbook 下，保持目录名和主 `.ino` 文件名一致：`MimiVent/MimiVent.ino`。
 - 首次接线烧录时使用 USB 数据线连接开发板；在 IDE 中选择对应串口和 `ESP32C3 Dev Module` 板卡配置。
 
@@ -166,8 +166,9 @@ arduino-cli upload --fqbn esp32:esp32:esp32c3:PartitionScheme=min_spiffs --port 
 
 - App 每次 BLE 连接后会把手机 Unix 时间和本地 UTC 偏移发送到设备。ESP32-C3 没有后备电池时钟；若本次开机期间尚未校时，事件会先以开机计时暂存，并在首次校时后回填。若在校时前再次断电，无法从设备本身还原这段时间对应的自然日，因此这些未校时事件不会计入日期统计。
 - PIR 活动沿、风机启动/停止等事件在发生时写入 SPIFFS 双槽快照；风机运行期间不会每秒写闪存。`/api/status` 可实时提供本轮运行时长，统计页约每 1 分钟刷新并显示进行中的运行时间；结束时保存最终时长和事件状态。
-- 每日汇总最多保留 365 天，事件明细最多保留 30 天（上限 512 条）；设备异常重启时，未完成的运行记录会标记为中断。
-- API：`POST /api/time` 校准手机时间，`GET /api/stats?mode=today|yesterday|threeDays|sevenDays` 读取汇总、时段桶和当日最近事件。BLE 与 HTTP 共用同一统计 API。
+- 每日汇总最多保留 365 天，事件明细最多保留 30 天（上限 512 条）；活动、自动/临时/强制排风、临时暂停、持续关闭和手动恢复自动感应都会写入事件明细。临时暂停记录设置时长，提前恢复时另记恢复事件；App 可按两条事件的时间差计算实际暂停时长。持续关闭在手动恢复时记结束事件，App 可计算实际关闭时长。设备异常重启时，未完成的排风记录会标记为中断。
+- API：`POST /api/time` 校准手机时间；`GET /api/stats?mode=today|yesterday|threeDays|sevenDays` 返回汇总和时段桶。通用原始事件接口 `GET /api/events?start=<unix>&end=<unix>&kind=all|activity|automatic|manual|force|pause|locked_off&offset=0&limit=32` 使用左闭右开时间区间 `[start,end)`，支持任意日期区间、事件类型筛选和分页；每页最多 32 条，返回 `nextOffset`、`total`、`hasMore`。App 负责把连续的原始感应事件合并成展示分组；固件不预先聚合事件。历史事件受 512 条全局明细容量和 30 天保留期限制，分页不能恢复已被新事件覆盖的记录。近 3 天和近 7 天统计汇总仍由 `/api/stats` 返回。BLE 与 HTTP 共用同一事件查询接口。
+- `/api/status` 包含 `firmware` 与 `minimumAppVersion`；当前候选固件要求 MimiVent App `v0.2.1` 或更新版本才能完整呈现统计功能。控制接口最低兼容固件为 `v0.2.0`。App 以固件版本做兼容提示；低于推荐固件时会说明当前控制仍可用、哪些统计需要升级。
 - 统计数据保存在 SPIFFS（128 KiB），配置仍保存在 NVS。首次初始化空分区时会格式化并写入 NVS 初始化标记；已初始化过的分区若挂载失败，固件会禁用统计并保留分区现场，不会自动格式化历史数据。若需要手动恢复，应先备份统计分区，再执行明确的格式化操作。
 
 ## 首次上电与验证
@@ -265,7 +266,7 @@ PIR 模块自身输出 HIGH 的保持时间由模块电位器控制；软件离�
 
 ## 版本管理
 
-- 当前正式版本：`v0.3.0`。`v0.1.0` 完成基础风机与本地网页实机验证；`v0.2.0` 增加 BLE 网页控制及 HTTP/BLE 共用时序输入校验；`v0.3.0` 增加设备统计、时间回填及 SPIFFS 数据保护。统计跨重启恢复和 BLE 长时间连接的回归结果请结合目标设备验证。此前提交均为未纳入版本号管理的硬件和网页调试 demo。
+- 当前正式版本：`v0.3.1`。`v0.1.0` 完成基础风机与本地网页实机验证；`v0.2.0` 增加 BLE 网页控制及 HTTP/BLE 共用时序输入校验；`v0.3.0` 增加设备统计、时间回填及 SPIFFS 数据保护；`v0.3.1` 增加通用原始事件筛选分页和控制事件恢复记录。此前提交均为未纳入版本号管理的硬件和网页调试 demo。
 - 版本号集中在 `FirmwareVersion.h`，页面和串口启动日志自动读取该版本。
 - 每次迭代在 `CHANGELOG.md` 记录功能变化；准备发布时同步更新版本号并创建 Git tag，例如 `v0.2.0`。
 - 使用 `MAJOR.MINOR.PATCH`：不兼容改动升 MAJOR；新增兼容功能升 MINOR；兼容性修复升 PATCH。

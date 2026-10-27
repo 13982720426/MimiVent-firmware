@@ -68,6 +68,16 @@ bool parsePacket(const String& packet, ControlApiRequest* request) {
   request->switchProfile = fieldAt(packet, 6, &offset) == "1";
   const String body = packet.substring(offset);
   request->body = body;
+  if (request->path == "/api/stats") {
+    request->eventOffset = formValue(body, "offset");
+  }
+  if (request->path == "/api/events") {
+    request->eventStart = formValue(body, "start");
+    request->eventEnd = formValue(body, "end");
+    request->eventKind = formValue(body, "kind");
+    request->eventOffset = formValue(body, "offset");
+    request->eventLimit = formValue(body, "limit");
+  }
 
   if (request->method != "GET" && request->method != "POST") return false;
   if (!settingsStoreParseProfile(profile, &request->profile)) return false;
