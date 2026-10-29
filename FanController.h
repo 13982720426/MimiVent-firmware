@@ -54,11 +54,16 @@ void fanControllerStartTimedPause(unsigned long durationMs, unsigned long nowMs)
 // 启动忽略 PIR 的限时继电器/风机测试。
 void fanControllerStartForceTest(unsigned long durationMs, unsigned long nowMs);
 
+// 区分用户控制与 OTA 临时停风，避免内部控制污染用户操作统计。
+enum class FanControlSource : uint8_t { USER, OTA };
+
 // 立即取消临时操作、停止风机并恢复自动感应。
-void fanControllerSetAuto(unsigned long nowMs);
+void fanControllerSetAuto(unsigned long nowMs,
+                          FanControlSource source = FanControlSource::USER);
 
 // 进入需要用户手动解除的持续关闭状态。
-void fanControllerSetLockedOff(unsigned long nowMs);
+void fanControllerSetLockedOff(unsigned long nowMs,
+                               FanControlSource source = FanControlSource::USER);
 
 // 当前是否有进行中的倒计时/自动排风，需要先确认再替换。
 bool fanControllerHasInterruptibleTask();

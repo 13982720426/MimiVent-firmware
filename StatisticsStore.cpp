@@ -3,24 +3,35 @@
 
 #include <Preferences.h>
 #include <SPIFFS.h>
+#include <esp_system.h>
 #include <time.h>
 #include <sys/time.h>
+
+#include "StatisticsConfig.h"
+#include "StatisticsTypes.h"
+#include "FirmwareVersion.h"
 
 namespace {
 
 constexpr uint32_t kMagic = 0x4D565354;  // MVST
-constexpr uint16_t kSchema = 1;
-constexpr size_t kDailyCapacity = 365;
+constexpr uint16_t kSchema = FIRMWARE_STATISTICS_SCHEMA;
+constexpr size_t kDailyCapacity = StatisticsConfig::kSummaryRetentionDays;
 constexpr size_t kEventCapacity = 512;
 constexpr uint32_t kSecondsPerDay = 86400UL;
-constexpr uint32_t kRetentionSeconds = 30UL * kSecondsPerDay;
-constexpr uint32_t kDailyRetentionSeconds = 365UL * kSecondsPerDay;
+constexpr uint32_t kRetentionSeconds =
+    static_cast<uint32_t>(StatisticsConfig::kDetailRetentionDays) * kSecondsPerDay;
+constexpr uint32_t kDailyRetentionSeconds =
+    static_cast<uint32_t>(StatisticsConfig::kSummaryRetentionDays) * kSecondsPerDay;
 // ESP32-C3 无后备电池时钟。高位表示低位保存本次开机 millis 秒数。
 constexpr uint32_t kUnsyncedTimeFlag = 0x80000000UL;
 constexpr uint32_t kUnsyncedTimeMask = ~kUnsyncedTimeFlag;
 constexpr uint32_t kMillisWrapSeconds = 4294967UL;
 constexpr char kPreferencesNamespace[] = "MimiVent";
-constexpr char kFilesystemReadyKey[] = "statsfs";
+// 新版使用独立 statistics 分区。单独的初始化标记避免误读旧版 SPIFFS 状态，
+// 同时首次格式化不会清除 NVS 中的运行配置。
+constexpr char kFilesystemReadyKey[] = "statsv3";
+constexpr char kDataEpochKey[] = "dataepoch";
+constexpr char kTimezoneOffsetKey[] = "tzoffset";
 constexpr char kSlotA[] = "/stats-a.bin";
 constexpr char kSlotB[] = "/stats-b.bin";
 
@@ -37,12 +48,13 @@ enum : uint8_t { kActive = 1, kComplete = 2, kInterrupted = 3 };
 
 struct DailyRecord {
   uint32_t dayKey;
-  uint32_t runtimeSeconds;
   uint16_t activityCount;
   uint16_t automaticCount;
+  uint32_t runtimeBuckets[24];
 };
 
 struct EventRecord {
+  uint32_t id;
   uint32_t unixSeconds;
   uint32_t durationSeconds;
   uint8_t kind;
@@ -58,6 +70,9 @@ struct StoreHeader {
   uint16_t reserved;
   uint32_t generation;
   uint32_t checksum;
+  uint32_t nextEventId;
+  EventRecord activeRun;
+  uint32_t droppedThroughEpoch;
 };
 
 DailyRecord daily[kDailyCapacity]{};
@@ -65,10 +80,33 @@ EventRecord events[kEventCapacity]{};
 size_t dailyCount = 0;
 size_t eventCount = 0;
 uint32_t generation = 0;
+uint32_t nextEventId = 1;
+char deviceIdHex[17] = {};
+char dataEpochHex[33] = {};
+char bootIdHex[17] = {};
 bool ready = false;
 bool clockReady = false;
 int16_t timezoneOffsetMinutes = 0;
 size_t activeEventIndex = kEventCapacity;
+EventRecord activeRun{};
+uint32_t droppedThroughEpoch = 0;
+bool filesystemPreviouslyInitialized = false;
+
+void updateDataEpoch(const uint8_t* epoch) {
+  for (size_t i = 0; i < 16; ++i) {
+    snprintf(dataEpochHex + i * 2, 3, "%02x", epoch[i]);
+  }
+}
+
+bool createNewDataEpoch(Preferences* preferences) {
+  uint8_t epoch[16]{};
+  esp_fill_random(epoch, sizeof(epoch));
+  if (preferences->putBytes(kDataEpochKey, epoch, sizeof(epoch)) != sizeof(epoch)) {
+    return false;
+  }
+  updateDataEpoch(epoch);
+  return true;
+}
 
 uint32_t checksumBytes(const uint8_t* bytes, size_t length) {
   uint32_t crc = 0xFFFFFFFFUL;
@@ -104,9 +142,16 @@ bool mountStatisticsFilesystem() {
   }
 
   const bool previouslyInitialized = preferences.getBool(kFilesystemReadyKey, false);
-  if (SPIFFS.begin(false)) {
-    if (!previouslyInitialized &&
-        preferences.putBool(kFilesystemReadyKey, true) != sizeof(bool)) {
+  filesystemPreviouslyInitialized = previouslyInitialized;
+  if (SPIFFS.begin(false, "/statistics", 10, "statistics")) {
+    // 首次挂载/升级到独立分区时建立新批次；App 会据此清除旧格式缓存。
+    if (!previouslyInitialized && !createNewDataEpoch(&preferences)) {
+      Serial.println("Statistics: failed to create data epoch on first mount");
+      SPIFFS.end();
+      preferences.end();
+      return false;
+    }
+    if (!previouslyInitialized && preferences.putBool(kFilesystemReadyKey, true) != sizeof(bool)) {
       Serial.println("Statistics: failed to persist filesystem marker");
       SPIFFS.end();
       preferences.end();
@@ -124,8 +169,15 @@ bool mountStatisticsFilesystem() {
     return false;
   }
 
-  if (!SPIFFS.format() || !SPIFFS.begin(false)) {
+  if (!SPIFFS.format() || !SPIFFS.begin(false, "/statistics", 10, "statistics")) {
     Serial.println("Statistics: first-use SPIFFS initialization failed");
+    preferences.end();
+    return false;
+  }
+  // 文件系统首次格式化后生成新批次，避免 App 把旧缓存误认为本批数据。
+  if (!createNewDataEpoch(&preferences)) {
+    Serial.println("Statistics: failed to persist data epoch after format");
+    SPIFFS.end();
     preferences.end();
     return false;
   }
@@ -160,6 +212,73 @@ uint32_t dayKeyForEpoch(uint32_t epoch) {
                                (parts.tm_mon + 1) * 100 + parts.tm_mday);
 }
 
+DailyRecord* ensureDaily(uint32_t dayKey);
+uint64_t min64(uint64_t left, uint64_t right) { return left < right ? left : right; }
+uint64_t max64(uint64_t left, uint64_t right) { return left > right ? left : right; }
+
+// 按设备本地小时切分运行区间，小时桶同时作为图表和汇总的唯一来源。
+void addRuntimeToDaily(uint32_t startEpoch, uint64_t durationSeconds) {
+  if (!startEpoch || !durationSeconds) return;
+  uint64_t cursor = startEpoch;
+  const uint64_t end = cursor + durationSeconds;
+  while (cursor < end && cursor <= UINT32_MAX) {
+    const uint32_t cursorEpoch = static_cast<uint32_t>(cursor);
+    const uint32_t dayKey = dayKeyForEpoch(cursorEpoch);
+    const int64_t localEpoch = static_cast<int64_t>(cursorEpoch) +
+        static_cast<int32_t>(timezoneOffsetMinutes) * 60;
+    const int64_t nextLocalHour = (localEpoch / 3600 + 1) * 3600;
+    const int64_t nextUtcHour = nextLocalHour -
+        static_cast<int32_t>(timezoneOffsetMinutes) * 60;
+    const uint64_t sliceEnd = min64(end, static_cast<uint64_t>(nextUtcHour));
+    const uint64_t sliceSeconds = sliceEnd > cursor ? sliceEnd - cursor : end - cursor;
+    DailyRecord* day = ensureDaily(dayKey);
+    if (day) {
+      const uint8_t hour = (localEpoch % kSecondsPerDay) / 3600;
+      const uint64_t total = static_cast<uint64_t>(day->runtimeBuckets[hour]) + sliceSeconds;
+      day->runtimeBuckets[hour] = total > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(total);
+    }
+    cursor += sliceSeconds;
+  }
+}
+
+bool isFanRuntimeKind(uint8_t kind) {
+  return kind == kAutomatic || kind == kManual || kind == kForce;
+}
+
+// 将区间裁剪到统计窗口后分配到实际覆盖的小时/日桶。
+void addRuntimeToBuckets(uint32_t startEpoch, uint64_t durationSeconds,
+                         uint32_t periodStart, uint32_t periodEnd,
+                         uint8_t bucketSpanHours, uint8_t bucketCount,
+                         uint64_t* buckets) {
+  if (!startEpoch || !durationSeconds || periodEnd <= periodStart) return;
+  uint64_t cursor = max64(startEpoch, periodStart);
+  const uint64_t intervalEnd = static_cast<uint64_t>(startEpoch) + durationSeconds;
+  const uint64_t end = min64(intervalEnd, periodEnd);
+  const int32_t offsetSeconds = static_cast<int32_t>(timezoneOffsetMinutes) * 60;
+  const int64_t localPeriodDay =
+      (static_cast<int64_t>(periodStart) + static_cast<int32_t>(offsetSeconds)) /
+      kSecondsPerDay;
+  while (cursor < end && cursor <= UINT32_MAX) {
+    const uint32_t cursorEpoch = static_cast<uint32_t>(cursor);
+    const int64_t localEpoch = static_cast<int64_t>(cursorEpoch) +
+        static_cast<int32_t>(offsetSeconds);
+    const int64_t localDay = localEpoch / kSecondsPerDay;
+    const uint8_t hour = static_cast<uint8_t>((localEpoch % kSecondsPerDay) / 3600);
+    const uint32_t bucketsPerDay = 24 / bucketSpanHours;
+    const int64_t dayIndex = localDay - localPeriodDay;
+    const int64_t bucketIndex = dayIndex * bucketsPerDay + hour / bucketSpanHours;
+    const int64_t nextLocalBucket = localDay * kSecondsPerDay +
+        (static_cast<int64_t>(hour / bucketSpanHours) + 1) * bucketSpanHours * 3600;
+    const int64_t nextUtcBucket = nextLocalBucket - static_cast<int32_t>(offsetSeconds);
+    const uint64_t sliceEnd = min64(end, static_cast<uint64_t>(nextUtcBucket));
+    const uint64_t sliceSeconds = sliceEnd > cursor ? sliceEnd - cursor : end - cursor;
+    if (bucketIndex >= 0 && bucketIndex < bucketCount) {
+      buckets[bucketIndex] += sliceSeconds;
+    }
+    cursor += sliceSeconds;
+  }
+}
+
 size_t findDaily(uint32_t dayKey) {
   for (size_t i = 0; i < dailyCount; ++i) {
     if (daily[i].dayKey == dayKey) return i;
@@ -175,17 +294,22 @@ DailyRecord* ensureDaily(uint32_t dayKey) {
     memmove(daily, daily + 1, (kDailyCapacity - 1) * sizeof(DailyRecord));
     --dailyCount;
   }
-  daily[dailyCount] = {dayKey, 0, 0, 0};
+  daily[dailyCount] = {};
+  daily[dailyCount].dayKey = dayKey;
   return &daily[dailyCount++];
 }
 
 bool readHeader(const char* path, StoreHeader* header) {
   File file = SPIFFS.open(path, FILE_READ);
-  if (!file || file.size() < sizeof(StoreHeader)) return false;
-  if (file.read(reinterpret_cast<uint8_t*>(header), sizeof(StoreHeader)) !=
-      sizeof(StoreHeader)) return false;
+  if (!file) return false;
+  if (file.size() < sizeof(StoreHeader) ||
+      file.read(reinterpret_cast<uint8_t*>(header), sizeof(StoreHeader)) != sizeof(StoreHeader)) {
+    file.close();
+    return false;
+  }
   if (header->magic != kMagic || header->schema != kSchema ||
       header->dailyCount > kDailyCapacity || header->eventCount > kEventCapacity) {
+    file.close();
     return false;
   }
   file.close();
@@ -194,21 +318,27 @@ bool readHeader(const char* path, StoreHeader* header) {
 
 bool readSlot(const char* path, StoreHeader* header) {
   File file = SPIFFS.open(path, FILE_READ);
-  if (!file || file.size() < sizeof(StoreHeader)) return false;
-  if (file.read(reinterpret_cast<uint8_t*>(header), sizeof(StoreHeader)) !=
-      sizeof(StoreHeader)) return false;
-  if (header->magic != kMagic || header->schema != kSchema ||
-      header->dailyCount > kDailyCapacity || header->eventCount > kEventCapacity) return false;
-  const size_t dailyBytes = header->dailyCount * sizeof(DailyRecord);
-  const size_t eventBytes = header->eventCount * sizeof(EventRecord);
-  if (file.size() != sizeof(StoreHeader) + dailyBytes + eventBytes) return false;
-  if (file.read(reinterpret_cast<uint8_t*>(daily), dailyBytes) != dailyBytes ||
-      file.read(reinterpret_cast<uint8_t*>(events), eventBytes) != eventBytes) {
+  if (!file) return false;
+  if (file.size() < sizeof(StoreHeader) ||
+      file.read(reinterpret_cast<uint8_t*>(header), sizeof(StoreHeader)) != sizeof(StoreHeader) ||
+      header->magic != kMagic || header->schema != kSchema ||
+      header->dailyCount > kDailyCapacity || header->eventCount > kEventCapacity) {
+    file.close();
     return false;
   }
-  uint32_t expected = header->checksum;
+  uint32_t checksum = 0;
+  const size_t eventBytes = header->eventCount * sizeof(EventRecord);
+  const uint32_t expected = header->checksum;
+  const size_t dailyBytes = header->dailyCount * sizeof(DailyRecord);
+  const size_t headerBytes = sizeof(StoreHeader);
+  if (file.size() != headerBytes + dailyBytes + eventBytes ||
+      file.read(reinterpret_cast<uint8_t*>(daily), dailyBytes) != dailyBytes ||
+      file.read(reinterpret_cast<uint8_t*>(events), eventBytes) != eventBytes) {
+    file.close();
+    return false;
+  }
   header->checksum = 0;
-  uint32_t checksum = checksumBytes(reinterpret_cast<uint8_t*>(header), sizeof(*header));
+  checksum = checksumBytes(reinterpret_cast<uint8_t*>(header), sizeof(*header));
   checksum = checksumBytes(reinterpret_cast<uint8_t*>(daily), dailyBytes) ^ checksum;
   checksum = checksumBytes(reinterpret_cast<uint8_t*>(events), eventBytes) ^ checksum;
   header->checksum = expected;
@@ -219,7 +349,8 @@ bool readSlot(const char* path, StoreHeader* header) {
 bool persist() {
   if (!ready) return false;
   StoreHeader header{kMagic, kSchema, static_cast<uint16_t>(dailyCount),
-                     static_cast<uint16_t>(eventCount), 0, generation + 1, 0};
+                     static_cast<uint16_t>(eventCount), 0, generation + 1, 0,
+                     nextEventId, activeRun, droppedThroughEpoch};
   uint32_t checksum = checksumBytes(reinterpret_cast<uint8_t*>(&header), sizeof(header));
   checksum = checksumBytes(reinterpret_cast<uint8_t*>(daily), dailyCount * sizeof(DailyRecord)) ^ checksum;
   checksum = checksumBytes(reinterpret_cast<uint8_t*>(events), eventCount * sizeof(EventRecord)) ^ checksum;
@@ -236,6 +367,8 @@ bool persist() {
   return written;
 }
 
+void findActiveEvent();
+
 void prune() {
   const uint32_t now = currentEpoch();
   if (!now) return;
@@ -244,9 +377,12 @@ void prune() {
   for (size_t i = 0; i < eventCount; ++i) {
     if (events[i].state == kActive || !events[i].unixSeconds || events[i].unixSeconds >= eventCutoff) {
       events[out++] = events[i];
+    } else if (events[i].unixSeconds && !isUnsyncedTime(events[i].unixSeconds)) {
+      droppedThroughEpoch = max(droppedThroughEpoch, events[i].unixSeconds);
     }
   }
   eventCount = out;
+  findActiveEvent();
 
   const uint32_t dayCutoff = now > kDailyRetentionSeconds ? now - kDailyRetentionSeconds : 0;
   const uint32_t cutoffKey = dayKeyForEpoch(dayCutoff);
@@ -268,15 +404,32 @@ void findActiveEvent() {
 }
 
 void addEvent(uint8_t kind, uint8_t state, uint32_t durationSeconds = 0) {
-  const uint32_t timestamp = eventTimestamp();
-  if (eventCount == kEventCapacity) {
-    memmove(events, events + 1, (kEventCapacity - 1) * sizeof(EventRecord));
-    --eventCount;
-    if (activeEventIndex < kEventCapacity) {
-      activeEventIndex = activeEventIndex == 0 ? kEventCapacity : activeEventIndex - 1;
-    }
+  // ID 作为分页游标必须单调且不可复用；耗尽时停止写入，等待显式重置数据批次。
+  if (nextEventId == 0) {
+    Serial.println("Statistics: event ID exhausted; refusing to reuse IDs");
+    return;
   }
-  events[eventCount] = {timestamp, durationSeconds, kind, state, 0};
+  size_t eviction = 0;
+  if (eventCount == kEventCapacity) {
+    // 待校时运行区间优先保留，避免 PIR 明细挤掉尚未归入小时桶的时长。
+    while (eviction < eventCount && isFanRuntimeKind(events[eviction].kind) &&
+           isUnsyncedTime(events[eviction].unixSeconds)) ++eviction;
+    if (eviction == eventCount) {
+      // 全部为待校时运行记录时，不再用活动明细替换它们。
+      if (kind == kActivity) return;
+      eviction = 0;
+    }
+    if (!isUnsyncedTime(events[eviction].unixSeconds)) {
+      droppedThroughEpoch = max(droppedThroughEpoch, events[eviction].unixSeconds);
+    }
+    memmove(events + eviction, events + eviction + 1,
+            (eventCount - eviction - 1) * sizeof(EventRecord));
+    --eventCount;
+  }
+  const uint32_t timestamp = eventTimestamp();
+  const uint32_t eventId = nextEventId;
+  nextEventId = eventId == UINT32_MAX ? 0 : eventId + 1;
+  events[eventCount] = {eventId, timestamp, durationSeconds, kind, state, 0};
   if (kind == kActivity) {
     DailyRecord* day = ensureDaily(currentDayKey());
     if (day && day->activityCount < 0xFFFF) ++day->activityCount;
@@ -284,9 +437,10 @@ void addEvent(uint8_t kind, uint8_t state, uint32_t durationSeconds = 0) {
     DailyRecord* day = ensureDaily(currentDayKey());
     if (day && day->automaticCount < 0xFFFF) ++day->automaticCount;
   }
+  if (state == kActive && isFanRuntimeKind(kind)) activeRun = events[eventCount];
   ++eventCount;
   prune();
-  if (kind != kActivity && state == kActive) findActiveEvent();
+  findActiveEvent();
   persist();
 }
 
@@ -311,9 +465,44 @@ bool eventInRange(const EventRecord& event, uint32_t start, uint32_t end) {
   return event.unixSeconds >= start && event.unixSeconds < end;
 }
 
+void initializeDatasetIdentity() {
+  const uint64_t mac = ESP.getEfuseMac();
+  snprintf(deviceIdHex, sizeof(deviceIdHex), "%016llx",
+           static_cast<unsigned long long>(mac));
+
+  uint8_t epoch[16]{};
+  Preferences preferences;
+  if (preferences.begin(kPreferencesNamespace, false)) {
+    timezoneOffsetMinutes = preferences.getShort(kTimezoneOffsetKey, 0);
+    const size_t storedLength = preferences.getBytesLength(kDataEpochKey);
+    if (storedLength != sizeof(epoch) ||
+        preferences.getBytes(kDataEpochKey, epoch, sizeof(epoch)) != sizeof(epoch)) {
+      esp_fill_random(epoch, sizeof(epoch));
+      if (preferences.putBytes(kDataEpochKey, epoch, sizeof(epoch)) != sizeof(epoch)) {
+        Serial.println("Statistics: failed to persist data epoch");
+        memset(epoch, 0, sizeof(epoch));
+      }
+    }
+    preferences.end();
+  } else {
+    Serial.println("Statistics: NVS unavailable while initializing data epoch");
+    memset(epoch, 0, sizeof(epoch));
+  }
+  updateDataEpoch(epoch);
+
+  uint8_t bootId[8]{};
+  esp_fill_random(bootId, sizeof(bootId));
+  for (size_t i = 0; i < sizeof(bootId); ++i) {
+    snprintf(bootIdHex + i * 2, 3, "%02x", bootId[i]);
+  }
+}
+
 }  // namespace
 
+uint16_t statisticsStoreSchemaVersion() { return kSchema; }
+
 void statisticsStoreBegin() {
+  initializeDatasetIdentity();
   if (!mountStatisticsFilesystem()) {
     Serial.println("Statistics: SPIFFS unavailable; statistics disabled");
     return;
@@ -337,12 +526,36 @@ void statisticsStoreBegin() {
     dailyCount = selected.dailyCount;
     eventCount = selected.eventCount;
     generation = selected.generation;
+    nextEventId = selected.nextEventId;
+    activeRun = selected.activeRun;
+    droppedThroughEpoch = selected.droppedThroughEpoch;
+  } else if (filesystemPreviouslyInitialized) {
+    // 两个快照都无法校验时，把统计视为丢失并切换 dataEpoch；
+    // App 不会把旧批次缓存或游标混入恢复后的空数据集。
+    dailyCount = 0;
+    eventCount = 0;
+    generation = 0;
+    nextEventId = 1;
+    Preferences preferences;
+    if (!preferences.begin(kPreferencesNamespace, false)) {
+      Serial.println("Statistics: failed to rotate data epoch after snapshot loss");
+      return;
+    }
+    const bool epochUpdated = createNewDataEpoch(&preferences);
+    preferences.end();
+    if (!epochUpdated) {
+      Serial.println("Statistics: failed to rotate data epoch after snapshot loss");
+      return;
+    }
+    Serial.println("Statistics: snapshot loss detected; starting an empty dataset");
   }
-  // 本次开机前尚未校时的事件无法在重启后还原日期，丢弃其不完整时间戳；
-  // 已有可信时间戳的运行事件则保留并标记为重启中断。
+  // 重启后不能推算断电区间，独立运行记录也停止计时。
+  activeRun = {};
+  // 未校时事件保留但清除不可恢复的 uptime 时间戳；可信时间戳的运行事件
+  // 保留并标记为重启中断，避免断电/重刷后制造虚假的运行时长。
   size_t out = 0;
   for (size_t i = 0; i < eventCount; ++i) {
-    if (isUnsyncedTime(events[i].unixSeconds)) continue;
+    if (isUnsyncedTime(events[i].unixSeconds)) events[i].unixSeconds = 0;
     if (events[i].state == kActive) events[i].state = kInterrupted;
     events[out++] = events[i];
   }
@@ -359,7 +572,23 @@ bool statisticsStoreSetClock(uint32_t unixSeconds, int16_t utcOffsetMinutes) {
   if (unixSeconds < 1700000000UL || utcOffsetMinutes < -720 || utcOffsetMinutes > 840) return false;
   timeval tv{static_cast<time_t>(unixSeconds), 0};
   if (settimeofday(&tv, nullptr) != 0) return false;
-  timezoneOffsetMinutes = utcOffsetMinutes;
+  Preferences preferences;
+  if (!preferences.begin(kPreferencesNamespace, false)) return false;
+  // 日汇总只保存日期键，不保存每条汇总的时区。首次可信校时后固定统计时区，
+  // 避免手机时区变化让已有日期键被解释成另一个自然日。
+  const bool timezoneAlreadySet = preferences.isKey(kTimezoneOffsetKey);
+  const int16_t statisticsTimezone = timezoneAlreadySet
+      ? preferences.getShort(kTimezoneOffsetKey, 0)
+      : utcOffsetMinutes;
+  timezoneOffsetMinutes = statisticsTimezone;
+  const size_t timezoneBytes = timezoneAlreadySet
+      ? sizeof(int16_t)
+      : preferences.putShort(kTimezoneOffsetKey, statisticsTimezone);
+  preferences.end();
+  if (timezoneBytes != sizeof(int16_t)) {
+    Serial.println("Statistics: failed to persist timezone offset");
+    return false;
+  }
   clockReady = true;
 
   // 回填本次开机以来发生的未校时事件，并把已结束排风的时长归入对应日期。
@@ -383,9 +612,16 @@ bool statisticsStoreSetClock(uint32_t unixSeconds, int16_t utcOffsetMinutes) {
     } else if (event.kind == kAutomatic && day->automaticCount < 0xFFFF) {
       ++day->automaticCount;
     }
-    if (event.kind != kActivity && event.state != kActive) {
-      day->runtimeSeconds += event.durationSeconds;
+    if (isFanRuntimeKind(event.kind) && event.state != kActive) {
+      addRuntimeToDaily(event.unixSeconds, event.durationSeconds);
     }
+  }
+  if (activeRun.id && isUnsyncedTime(activeRun.unixSeconds)) {
+    const uint32_t uptime = activeRun.unixSeconds & kUnsyncedTimeMask;
+    const uint32_t elapsed = uptimeNow >= uptime ? uptimeNow - uptime
+        : uptimeNow + kMillisWrapSeconds - uptime;
+    activeRun.unixSeconds = elapsed < unixSeconds && unixSeconds - elapsed >= 1700000000UL
+        ? unixSeconds - elapsed : 0;
   }
   prune();
   findActiveEvent();
@@ -394,6 +630,10 @@ bool statisticsStoreSetClock(uint32_t unixSeconds, int16_t utcOffsetMinutes) {
 }
 
 bool statisticsStoreHasClock() { return clockReady || currentEpoch() != 0; }
+
+const char* statisticsStoreDeviceId() { return deviceIdHex; }
+const char* statisticsStoreDataEpoch() { return dataEpochHex; }
+const char* statisticsStoreBootId() { return bootIdHex; }
 
 void statisticsStoreRecordActivity() {
   if (!ready) return;
@@ -425,15 +665,16 @@ void statisticsStoreFanStarted(uint8_t kind, unsigned long nowMs) {
 }
 
 void statisticsStoreFanStopped(unsigned long durationMs) {
-  if (!ready || activeEventIndex >= eventCount) return;
-  EventRecord& event = events[activeEventIndex];
-  const bool timestampPending = isUnsyncedTime(event.unixSeconds);
-  event.state = kComplete;
-  event.durationSeconds = durationMs / 1000UL;
-  if (!timestampPending) {
-    DailyRecord* day = ensureDaily(dayKeyForEpoch(event.unixSeconds));
-    if (day) day->runtimeSeconds += event.durationSeconds;
+  if (!ready || activeRun.id == 0) return;
+  activeRun.state = kComplete;
+  activeRun.durationSeconds = durationMs / 1000UL;
+  if (!isUnsyncedTime(activeRun.unixSeconds)) {
+    addRuntimeToDaily(activeRun.unixSeconds, activeRun.durationSeconds);
   }
+  for (size_t i = 0; i < eventCount; ++i) {
+    if (events[i].id == activeRun.id) events[i] = activeRun;
+  }
+  activeRun = {};
   activeEventIndex = kEventCapacity;
   persist();
 }
@@ -453,10 +694,11 @@ String statisticsStoreBuildJson(const String& range, bool fanOn, unsigned long a
 
   const uint8_t bucketCount = range == "today" ? 24 : range == "yesterday" ? 12 : daySpan * (24 / bucketSpanHours);
   const uint32_t periodStart = todayStart - (range == "yesterday" ? kSecondsPerDay : range == "threeDays" ? 2 * kSecondsPerDay : range == "sevenDays" ? 6 * kSecondsPerDay : 0);
-  uint32_t runtimeSeconds = 0;
+  const uint32_t periodEnd = range == "yesterday" ? todayStart : now + 1;
+  uint64_t runtimeSeconds = 0;
   uint32_t activityCount = 0;
   uint32_t automaticCount = 0;
-  uint32_t buckets[24]{};
+  uint64_t buckets[24]{};
   String eventsJson = "[";
   uint16_t eventTotal = 0;
   uint8_t recentCount = 0;
@@ -468,42 +710,34 @@ String statisticsStoreBuildJson(const String& range, bool fanOn, unsigned long a
       const uint32_t epoch = periodStart + dayIndex * kSecondsPerDay;
       const uint32_t key = dayKeyForEpoch(epoch);
       if (day == key) {
-        runtimeSeconds += daily[i].runtimeSeconds;
         activityCount += daily[i].activityCount;
         automaticCount += daily[i].automaticCount;
+        // 小时桶独立保存，明细淘汰不会改变图表与汇总。
+        for (uint8_t hour = 0; hour < 24; ++hour) {
+          buckets[dayIndex * (24 / bucketSpanHours) + hour / bucketSpanHours] +=
+              daily[i].runtimeBuckets[hour];
+        }
       }
     }
   }
-
-  for (size_t i = 0; i < eventCount; ++i) {
-    if (!now) continue;
-    EventRecord event = events[i];
-    // 活动事件的运行时长在下面统一加入一次，避免当前运行时长被重复计入图表。
-    if (event.state == kActive && i == activeEventIndex) continue;
-    if (!eventInRange(event, periodStart, now + 1)) continue;
-    const time_t localEpoch = static_cast<time_t>(static_cast<int64_t>(event.unixSeconds) + signedOffsetSeconds);
-    struct tm parts{};
-    gmtime_r(&localEpoch, &parts);
-    const uint32_t dayIndex = static_cast<uint32_t>((event.unixSeconds - periodStart) / kSecondsPerDay);
-    const uint32_t bucket = dayIndex * (24 / bucketSpanHours) + parts.tm_hour / bucketSpanHours;
-    if (bucket < bucketCount && event.kind != kActivity) buckets[bucket] += event.durationSeconds;
+  if (now && activeRunMs && activeRun.id) {
+    const EventRecord& current = activeRun;
+    if (isFanRuntimeKind(current.kind) && current.unixSeconds &&
+        !isUnsyncedTime(current.unixSeconds)) {
+      const uint64_t activeSeconds = activeRunMs / 1000UL;
+      addRuntimeToBuckets(current.unixSeconds, activeSeconds,
+                          periodStart, periodEnd, bucketSpanHours,
+                          bucketCount, buckets);
+    }
   }
-  if (activeRunMs && activeEventIndex < eventCount && events[activeEventIndex].unixSeconds >= periodStart) {
-    runtimeSeconds += activeRunMs / 1000UL;
-    const EventRecord& current = events[activeEventIndex];
-    const time_t localEpoch = static_cast<time_t>(static_cast<int64_t>(current.unixSeconds) + signedOffsetSeconds);
-    struct tm parts{};
-    gmtime_r(&localEpoch, &parts);
-    const uint32_t dayIndex = static_cast<uint32_t>((current.unixSeconds - periodStart) / kSecondsPerDay);
-    const uint32_t bucket = dayIndex * (24 / bucketSpanHours) + parts.tm_hour / bucketSpanHours;
-    if (bucket < bucketCount && current.kind != kActivity) buckets[bucket] += activeRunMs / 1000UL;
-  }
+  for (uint8_t bucket = 0; bucket < bucketCount; ++bucket) runtimeSeconds += buckets[bucket];
+  uint32_t eventStart = 0;
+  uint32_t eventEnd = 0;
+  uint32_t nextCursor = 0;
   if (range == "today" || range == "yesterday") {
-    // 今日按滚动 24 小时查询；昨日按本地自然日查询，由 mode 参数决定窗口。
-    const uint32_t eventStart = range == "today"
-        ? (now > kSecondsPerDay ? now - kSecondsPerDay : 0)
-        : periodStart;
-    const uint32_t eventEnd = range == "today" ? now + 1 : todayStart;
+    // 今日和昨日都使用本地自然日边界；今日窗口从本地零点到本次响应时间。
+    eventStart = range == "today" ? todayStart : periodStart;
+    eventEnd = range == "today" ? now + 1 : todayStart;
     for (int i = static_cast<int>(eventCount) - 1; i >= 0; --i) {
       if (!now) break;
       EventRecord event = events[i];
@@ -511,20 +745,30 @@ String statisticsStoreBuildJson(const String& range, bool fanOn, unsigned long a
       if (!eventInRange(event, eventStart, eventEnd)) continue;
       if (eventTotal >= eventOffset && recentCount < 32) {
         if (recentCount++) eventsJson += ',';
-        eventsJson += "{\"time\":" + String(event.unixSeconds) + ",\"kind\":\"" + kindName(event.kind) +
+        eventsJson += "{\"id\":" + String(event.id) +
+                      ",\"time\":" + String(event.unixSeconds) + ",\"kind\":\"" + kindName(event.kind) +
                       "\",\"state\":\"" + stateName(event.state) + "\",\"durationSeconds\":" + String(event.durationSeconds) + "}";
+        nextCursor = event.id;
       }
       if (eventTotal < 0xFFFF) ++eventTotal;
     }
   }
   eventsJson += ']';
-  String json = "{\"timeSynced\":" + String(statisticsStoreHasClock() ? "true" : "false") +
+  String json = "{\"deviceId\":\"" + String(statisticsStoreDeviceId()) +
+      "\",\"dataEpoch\":\"" + String(statisticsStoreDataEpoch()) +
+      "\",\"bootId\":\"" + String(statisticsStoreBootId()) +
+      "\",\"timeSynced\":" + String(statisticsStoreHasClock() ? "true" : "false") +
       ",\"active\":" + String(fanOn ? "true" : "false") +
       ",\"range\":\"" + range + "\",\"runtimeSeconds\":" + String(runtimeSeconds) +
       ",\"activityCount\":" + String(activityCount) + ",\"automaticCount\":" + String(automaticCount) + ",\"bucketSeconds\":[";
   for (uint8_t i = 0; i < bucketCount; ++i) { if (i) json += ','; json += String(buckets[i]); }
   json += "],\"events\":" + eventsJson;
   const bool eventsHasMore = static_cast<uint32_t>(eventOffset) + recentCount < eventTotal;
+  json += ",\"statisticsSchema\":" + String(kSchema);
+  json += ",\"eventsTruncated\":" + String(droppedThroughEpoch && periodStart <= droppedThroughEpoch ? "true" : "false");
+  json += ",\"eventsStart\":" + String(eventStart) +
+          ",\"eventsEnd\":" + String(eventEnd) +
+          ",\"eventsNextCursor\":" + String(eventsHasMore ? nextCursor : 0);
   json += ",\"eventsOffset\":" + String(eventOffset) +
           ",\"eventsNextOffset\":" + String(eventOffset + recentCount) +
           ",\"eventsTotal\":" + String(eventTotal) +
@@ -536,13 +780,14 @@ String statisticsStoreBuildJson(const String& range, bool fanOn, unsigned long a
       if (dayIndex) json += ',';
       const uint32_t dayKey = dayKeyForEpoch(periodStart + dayIndex * kSecondsPerDay);
       const size_t recordIndex = findDaily(dayKey);
-      if (recordIndex == kDailyCapacity) {
-        json += "{\"date\":" + String(dayKey) + ",\"runtimeSeconds\":0,\"activityCount\":0,\"automaticCount\":0}";
-      } else {
-        const DailyRecord& day = daily[recordIndex];
-        json += "{\"date\":" + String(day.dayKey) + ",\"runtimeSeconds\":" + String(day.runtimeSeconds) +
-                ",\"activityCount\":" + String(day.activityCount) + ",\"automaticCount\":" + String(day.automaticCount) + "}";
+      uint64_t daySeconds = 0;
+      const uint8_t bucketsPerDay = 24 / bucketSpanHours;
+      for (uint8_t bucket = 0; bucket < bucketsPerDay; ++bucket) {
+        daySeconds += buckets[dayIndex * bucketsPerDay + bucket];
       }
+      json += "{\"date\":" + String(dayKey) + ",\"runtimeSeconds\":" + String(daySeconds) +
+              ",\"activityCount\":" + String(recordIndex < kDailyCapacity ? daily[recordIndex].activityCount : 0) +
+              ",\"automaticCount\":" + String(recordIndex < kDailyCapacity ? daily[recordIndex].automaticCount : 0) + "}";
     }
     json += ']';
   }
@@ -552,36 +797,49 @@ String statisticsStoreBuildJson(const String& range, bool fanOn, unsigned long a
 
 String statisticsStoreBuildEventsJson(uint32_t start, uint32_t end, const String& kind,
                                       uint16_t offset, uint8_t limit,
-                                      unsigned long activeRunMs) {
+                                      unsigned long activeRunMs,
+                                      uint32_t beforeId) {
   String eventsJson = "[";
   uint16_t total = 0;
   uint8_t count = 0;
+  uint16_t eligible = 0;
+  uint32_t nextCursor = 0;
   for (int i = static_cast<int>(eventCount) - 1; i >= 0; --i) {
-    if (!clockReady) break;
+    // OTA 软件重启后 RTC 仍可能有效，与汇总接口使用同一可信时钟判断。
+    if (!statisticsStoreHasClock()) break;
     EventRecord event = events[i];
     if (!eventInRange(event, start, end)) continue;
     const String eventKind = kindName(event.kind);
     if (kind != "all" && kind != eventKind) continue;
+    if (total < 0xFFFF) ++total;
+    if (beforeId && event.id >= beforeId) continue;
     if (event.state == kActive && static_cast<size_t>(i) == activeEventIndex) {
       event.durationSeconds = activeRunMs / 1000UL;
     }
-    if (total >= offset && count < limit) {
+    ++eligible;
+    if (eligible > offset && count < limit) {
       if (count++) eventsJson += ',';
-      eventsJson += "{\"time\":" + String(event.unixSeconds) +
+      eventsJson += "{\"id\":" + String(event.id) +
+                    ",\"time\":" + String(event.unixSeconds) +
                     ",\"kind\":\"" + eventKind +
                     "\",\"state\":\"" + stateName(event.state) +
                     "\",\"durationSeconds\":" + String(event.durationSeconds) + "}";
+      nextCursor = event.id;
     }
-    if (total < 0xFFFF) ++total;
   }
   eventsJson += ']';
   const uint16_t nextOffset = offset + count;
-  const bool hasMore = nextOffset < total;
-  String json = "{\"start\":" + String(start) + ",\"end\":" + String(end) +
+  const bool hasMore = eligible > offset + count;
+  String json = "{\"deviceId\":\"" + String(statisticsStoreDeviceId()) +
+                "\",\"dataEpoch\":\"" + String(statisticsStoreDataEpoch()) +
+                "\",\"bootId\":\"" + String(statisticsStoreBootId()) +
+                "\",\"eventsTruncated\":" + String(droppedThroughEpoch && start <= droppedThroughEpoch ? "true" : "false") +
+                ",\"start\":" + String(start) + ",\"end\":" + String(end) +
                 ",\"kind\":\"" + kind + "\",\"events\":" + eventsJson +
                 ",\"offset\":" + String(offset) +
                 ",\"nextOffset\":" + String(nextOffset) +
                 ",\"total\":" + String(total) +
+                ",\"nextCursor\":" + String(hasMore ? nextCursor : 0) +
                 ",\"hasMore\":" + String(hasMore ? "true" : "false") + "}";
   return json;
 }

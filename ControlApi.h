@@ -4,8 +4,7 @@
 
 #include "SettingsStore.h"
 
-// 两种传输层共用的请求类型。WebDashboard 将 HTTP 参数映射到此结构；
-// BluetoothManager 将 BLE 网页命令映射到同一结构。
+// 设备业务请求类型。BLE 与后续 Wi-Fi 传输层映射到同一组接口。
 struct ControlApiRequest {
   String method;
   String path;
@@ -16,6 +15,8 @@ struct ControlApiRequest {
   String eventEnd;
   String eventKind;
   String eventOffset;
+  String eventBeforeId;
+  String eventDataEpoch;
   String eventLimit;
   String body;
   bool replace = false;

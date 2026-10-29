@@ -1,4 +1,4 @@
-// 统一维护 HTTP 与 BLE 共用的业务规则，传输层只负责解析请求和发送响应。
+// 统一维护设备业务规则，传输层只负责解析请求和发送响应。
 #include "ControlApi.h"
 
 #include <cstdio>
@@ -68,13 +68,14 @@ ControlApiResponse statusResponse(TimingProfile viewProfile) {
            "{\"fan\":%s,\"pir\":%s,\"mode\":\"%s\",\"phase\":\"%s\","
            "\"activeProfile\":\"%s\",\"viewProfile\":\"%s\",\"fanRunMs\":%lu,"
            "\"remainingMs\":%lu,\"durationMs\":%lu,\"phaseDurationMs\":%lu,\"startupCooldownMs\":%lu,\"leaveConfirmMs\":%lu,"
-           "\"autoExhaustMs\":%lu,\"manualExhaustMs\":%lu,\"pauseMs\":%lu,\"firmware\":\"%s\",\"minimumAppVersion\":\"%s\"}",
+           "\"autoExhaustMs\":%lu,\"manualExhaustMs\":%lu,\"pauseMs\":%lu,\"firmware\":\"%s\",\"minimumAppVersion\":\"%s\",\"statisticsSchema\":%u}",
            status.fanOn ? "true" : "false", status.presenceDetected ? "true" : "false",
            fanControllerModeName(), fanControllerPhaseName(),
            settingsStoreProfileName(status.activeProfile), settingsStoreProfileName(viewProfile),
            status.fanRunMs, status.remainingMs, status.overrideDurationMs, status.phaseDurationMs,
            active.startupCooldownMs, active.leaveConfirmMs, active.autoExhaustMs,
-           active.manualExhaustMs, active.pauseMs, FIRMWARE_VERSION, FIRMWARE_MINIMUM_APP_VERSION);
+           active.manualExhaustMs, active.pauseMs, FIRMWARE_VERSION, FIRMWARE_MINIMUM_APP_VERSION,
+           statisticsStoreSchemaVersion());
   return response(200, "application/json; charset=utf-8", payload);
 }
 
@@ -155,6 +156,7 @@ ControlApiResponse controlApiDispatch(const ControlApiRequest& request) {
     unsigned long start = 0;
     unsigned long end = 0;
     unsigned long offset = 0;
+    unsigned long beforeId = 0;
     unsigned long limit = 32;
     if (!parseUnsignedParameter(request.eventStart, &start) ||
         !parseUnsignedParameter(request.eventEnd, &end) || start >= end ||
@@ -164,6 +166,10 @@ ControlApiResponse controlApiDispatch(const ControlApiRequest& request) {
     if (request.eventOffset.length() &&
         (!parseUnsignedParameter(request.eventOffset, &offset) || offset > 512UL)) {
       return jsonError(400, "INVALID_EVENT_OFFSET");
+    }
+    if (request.eventBeforeId.length() &&
+        (!parseUnsignedParameter(request.eventBeforeId, &beforeId) || beforeId == 0)) {
+      return jsonError(400, "INVALID_EVENT_CURSOR");
     }
     if (request.eventLimit.length() &&
         (!parseUnsignedParameter(request.eventLimit, &limit) || limit < 1 || limit > 32)) {
@@ -175,12 +181,16 @@ ControlApiResponse controlApiDispatch(const ControlApiRequest& request) {
         kind != "locked_off" && kind != "resume") {
       return jsonError(400, "INVALID_EVENT_KIND");
     }
+    if (request.eventDataEpoch.length() &&
+        request.eventDataEpoch != statisticsStoreDataEpoch()) {
+      return jsonError(409, "DATASET_CHANGED");
+    }
     const FanControllerStatus status = fanControllerGetStatus(millis());
     return response(200, "application/json; charset=utf-8",
                     statisticsStoreBuildEventsJson(
                         static_cast<uint32_t>(start), static_cast<uint32_t>(end), kind,
                         static_cast<uint16_t>(offset), static_cast<uint8_t>(limit),
-                        status.fanRunMs));
+                        status.fanRunMs, static_cast<uint32_t>(beforeId)));
   }
   if (request.path == "/api/stats" && request.method == "GET") {
     const FanControllerStatus status = fanControllerGetStatus(millis());

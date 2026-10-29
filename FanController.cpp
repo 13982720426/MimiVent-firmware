@@ -303,8 +303,9 @@ void fanControllerStartForceTest(unsigned long durationMs, unsigned long nowMs) 
   Serial.printf("Force fan test started for %lu ms (PIR ignored)\n", durationMs);
 }
 
-void fanControllerSetAuto(unsigned long nowMs) {
-  if (controlMode == ControlMode::LOCKED_OFF || controlMode == ControlMode::TIMED_OFF) {
+void fanControllerSetAuto(unsigned long nowMs, FanControlSource source) {
+  if (source == FanControlSource::USER &&
+      (controlMode == ControlMode::LOCKED_OFF || controlMode == ControlMode::TIMED_OFF)) {
     statisticsStoreRecordAutoResume();
   }
   controlMode = ControlMode::AUTO;
@@ -320,12 +321,12 @@ void fanControllerSetAuto(unsigned long nowMs) {
   Serial.println("Control mode: automatic sensing");
 }
 
-void fanControllerSetLockedOff(unsigned long nowMs) {
+void fanControllerSetLockedOff(unsigned long nowMs, FanControlSource source) {
   skipStartupCooldown(nowMs);
   controlMode = ControlMode::LOCKED_OFF;
   overrideDurationMs = 0;
   setFan(false, nowMs);
-  statisticsStoreRecordLockedOff();
+  if (source == FanControlSource::USER) statisticsStoreRecordLockedOff();
   Serial.println("Control mode: locked off");
 }
 

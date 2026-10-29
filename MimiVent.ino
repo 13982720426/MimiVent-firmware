@@ -5,8 +5,7 @@
 
   主程序只负责模块初始化和循环调度：
   - FanController：PIR、继电器和排风模式
-  - WifiManager：ESP32 本地热点
-  - WebDashboard：手机页面与 HTTP API
+  - BluetoothManager：BLE 控制与 OTA
   - StatusLed：板载 WS2812 状态灯
 */
 
@@ -17,8 +16,13 @@
 #include "StatusLed.h"
 #include "SettingsStore.h"
 #include "StatisticsStore.h"
-#include "WebDashboard.h"
-#include "WifiManager.h"
+#include "OtaManager.h"
+#include <esp_partition.h>
+#include <esp_ota_ops.h>
+
+// Arduino-ESP32 默认在 initArduino() 中无条件确认新镜像；延后到 setup 完整启动后再确认，
+// 让启动早期崩溃仍可由 ESP-IDF 回滚到原应用槽。
+extern "C" bool verifyRollbackLater(void) { return true; }
 
 void setup() {
   Serial.begin(115200);
@@ -28,17 +32,44 @@ void setup() {
   fanControllerBegin();
   statisticsStoreBegin();
   statusLedBegin();
+  otaManagerBegin();
 
-  const bool accessPointStarted = wifiManagerBegin();
-  webDashboardBegin();
   bluetoothManagerBegin();
+  otaManagerConfirmBoot();
 
   Serial.println();
   Serial.printf("MimiVent v%s ready\n", FIRMWARE_VERSION);
-  Serial.printf("AP: %s / %s\n", AppConfig::kApSsid, AppConfig::kApPassword);
-  Serial.printf("Dashboard: http://%s\n", wifiManagerGetIp().c_str());
-  Serial.printf("AP status: %s\n", accessPointStarted ? "started" : "failed");
+  Serial.println(FIRMWARE_IMAGE_MARKER);
+  Serial.println(FIRMWARE_STATISTICS_SCHEMA_MARKER);
+  Serial.println(FIRMWARE_PARTITION_PROFILE_MARKER);
   Serial.printf("BLE device: %s\n", AppConfig::kBleDeviceName);
+  Serial.println("Partition table:");
+  esp_partition_iterator_t partition = esp_partition_find(
+      ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_ANY, nullptr);
+  while (partition) {
+    const esp_partition_t* item = esp_partition_get(partition);
+    if (item) Serial.printf("  app %-12s address=0x%06lx size=%lu\n",
+                            item->label, static_cast<unsigned long>(item->address),
+                            static_cast<unsigned long>(item->size));
+    partition = esp_partition_next(partition);
+  }
+  partition = esp_partition_find(ESP_PARTITION_TYPE_DATA,
+                                  ESP_PARTITION_SUBTYPE_ANY, nullptr);
+  while (partition) {
+    const esp_partition_t* item = esp_partition_get(partition);
+    if (item) Serial.printf("  data %-11s address=0x%06lx size=%lu\n",
+                            item->label, static_cast<unsigned long>(item->address),
+                            static_cast<unsigned long>(item->size));
+    partition = esp_partition_next(partition);
+  }
+  const esp_partition_t* nextUpdate = esp_ota_get_next_update_partition(nullptr);
+  if (nextUpdate) {
+    Serial.printf("OTA next slot: %s address=0x%06lx size=%lu\n", nextUpdate->label,
+                  static_cast<unsigned long>(nextUpdate->address),
+                  static_cast<unsigned long>(nextUpdate->size));
+  } else {
+    Serial.println("OTA next slot: unavailable; selected partition table is not OTA-capable");
+  }
   const TimingSettings production = settingsStoreGet(TimingProfile::PRODUCTION);
   const TimingSettings dev = settingsStoreGet(TimingProfile::DEV);
   Serial.printf("Production timing: startup cooldown %lu ms; leave %lu ms; automatic exhaust %lu ms; manual %lu ms; pause %lu ms\n",
@@ -50,9 +81,8 @@ void setup() {
 }
 
 void loop() {
-  // 先处理网页命令，再读取时钟。命令处理器可能刚设置 overrideStartedMs；
+  // 先处理 BLE 命令，再读取时钟。命令处理器可能刚设置 overrideStartedMs；
   // 若使用处理请求之前保存的 nowMs，unsigned 差值会下溢并让定时模式立即到期。
-  webDashboardUpdate();
   bluetoothManagerUpdate();
 
   const unsigned long nowMs = millis();
