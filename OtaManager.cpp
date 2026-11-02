@@ -15,6 +15,11 @@
 #include "FirmwareVersion.h"
 #include "OtaBleAdapter.h"
 #include "OtaCompression.h"
+#include "OtaTransferWorkspace.h"
+#include "WifiTlsResourceProbe.h"
+#include "WifiHttpsServer.h"
+#include "WifiProvisioningManager.h"
+#include <esp_heap_caps.h>
 #include "StatisticsStore.h"
 
 namespace {
@@ -67,8 +72,14 @@ uint32_t otaPackageBlockIndex = 0;
 uint8_t otaPackageDescriptor[kOtaPackageDescriptorBytes] = {};
 uint32_t otaPackageDescriptorBytes = 0;
 uint32_t otaPackageBlockBytes = 0;
+#if MIMIVENT_ENABLE_WIFI && MIMIVENT_OTA_DYNAMIC_WORKSPACE
+OtaTransferWorkspace transferWorkspace;
+uint8_t* otaPackageBlock = nullptr;
+uint8_t* otaImageBlock = nullptr;
+#else
 uint8_t otaPackageBlock[kOtaPackageBlockBytes] = {};
 uint8_t otaImageBlock[kOtaPackageBlockBytes] = {};
+#endif
 uint32_t otaPackageBlockRawLength = 0;
 uint32_t otaPackageBlockStoredLength = 0;
 uint32_t otaPackageBlockCrc = 0;
@@ -87,8 +98,13 @@ uint32_t otaDeltaSourceOffset = 0;
 uint32_t otaDeltaPayloadLength = 0;
 uint32_t otaDeltaOutputCrc = 0;
 uint8_t otaDeltaRecordType = 0;
+#if MIMIVENT_ENABLE_WIFI && MIMIVENT_OTA_DYNAMIC_WORKSPACE
+uint8_t* otaDeltaData = nullptr;
+uint8_t* otaDeltaOutput = nullptr;
+#else
 uint8_t otaDeltaData[kOtaDeltaBlockBytes] = {};
 uint8_t otaDeltaOutput[kOtaDeltaBlockBytes] = {};
+#endif
 uint8_t imageHeader[sizeof(esp_image_header_t)] = {};
 size_t imageHeaderBytes = 0;
 String expectedVersion;
@@ -108,7 +124,41 @@ volatile bool connectStatusPending = false;
 portMUX_TYPE connectionStateMux = portMUX_INITIALIZER_UNLOCKED;
 mbedtls_sha256_context shaContext;
 uint32_t crc32(const uint8_t* data, size_t length);
+const char* packageFailure="PACKAGE_BLOCK";
 void setStatus(const String& status);
+
+void releaseTransferMemory() {
+#if MIMIVENT_ENABLE_WIFI && MIMIVENT_OTA_DYNAMIC_WORKSPACE
+  transferWorkspace.reset();
+  otaPackageBlock = otaImageBlock = otaDeltaData = otaDeltaOutput = nullptr;
+  otaCompressionRelease();
+#endif
+}
+
+bool prepareTransferMemory(bool packageMode, bool deltaMode) {
+#if MIMIVENT_ENABLE_WIFI && MIMIVENT_OTA_DYNAMIC_WORKSPACE
+  releaseTransferMemory();
+  const size_t blockBytes = packageMode ? kOtaPackageBlockBytes : kOtaDeltaBlockBytes;
+  if (!(packageMode || deltaMode)) return true;
+  const bool buffersReady=transferWorkspace.reserve(blockBytes);
+  const bool inflaterReady=buffersReady&&otaCompressionPrepare();
+  if (!buffersReady || !inflaterReady) {
+    const auto caps=MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT;
+    Serial.printf("[ota-memory] block=%u buffers=%d inflater=%d free=%u largest=%u\n",
+        blockBytes,buffersReady,inflaterReady,heap_caps_get_free_size(caps),heap_caps_get_largest_free_block(caps));
+    releaseTransferMemory();
+    return false;
+  }
+  if (packageMode) {
+    otaPackageBlock = transferWorkspace.input();
+    otaImageBlock = transferWorkspace.output();
+  } else {
+    otaDeltaData = transferWorkspace.input();
+    otaDeltaOutput = transferWorkspace.output();
+  }
+#endif
+  return true;
+}
 
 // RSA-3072 公钥只用于验签；对应私钥保存在发布机仓库之外。
 static const unsigned char kOtaSigningPublicKey[] =
@@ -200,6 +250,7 @@ void suspendUpdate(const char* reason) {
   }
   if (active) mbedtls_sha256_free(&shaContext);
   active = false;
+  releaseTransferMemory();
   receivedSize = checkpointOffset;
   packageReceivedSize = (compressedPackage || deltaPackage)
       ? packageCheckpointOffset : checkpointOffset;
@@ -382,6 +433,7 @@ void abortUpdate(const char* reason, bool restoreAuto) {
   }
   if (active) mbedtls_sha256_free(&shaContext);
   active = false;
+  releaseTransferMemory();
   expectedSize = receivedSize = 0;
   imageHeaderBytes = 0;
   verifiedForInstall = false;
@@ -498,13 +550,13 @@ bool finishOtaPackageBlock() {
     decodedLength = otaPackageBlockRawLength;
   } else if (otaPackageBlockCodec == 1) {
     if (!otaInflateBlock(otaPackageBlock, otaPackageBlockStoredLength,
-                         otaImageBlock, sizeof(otaImageBlock), &decodedLength) ||
-        decodedLength != otaPackageBlockRawLength) return false;
+                         otaImageBlock, kOtaPackageBlockBytes, &decodedLength) ||
+        decodedLength != otaPackageBlockRawLength) {packageFailure="PACKAGE_DECOMPRESS";return false;}
   } else {
     return false;
   }
-  if (crc32(otaImageBlock, decodedLength) != otaPackageBlockCrc ||
-      !writeDecodedOtaBlock(otaImageBlock, decodedLength)) return false;
+  if (crc32(otaImageBlock, decodedLength) != otaPackageBlockCrc) {packageFailure="PACKAGE_CRC";return false;}
+  if (!writeDecodedOtaBlock(otaImageBlock, decodedLength)) {packageFailure="PACKAGE_FLASH";return false;}
   ++otaPackageBlockIndex;
   otaPackageDescriptorBytes = 0;
   otaPackageBlockBytes = 0;
@@ -516,7 +568,7 @@ bool finishOtaPackageBlock() {
     packageCheckpointOffset = packageReceivedSize;
   }
   if (expectedDurable < expectedSize && expectedDurable > checkpointOffset &&
-      !saveCheckpoint(expectedDurable)) return false;
+      !saveCheckpoint(expectedDurable)) {packageFailure="CHECKPOINT_WRITE";return false;}
   return true;
 }
 
@@ -617,7 +669,7 @@ bool finishOtaDeltaRecord() {
   } else if (otaDeltaRecordType == 1) {
     size_t outputLength = 0;
     if (!otaInflateBlock(otaDeltaData, otaDeltaPayloadLength, otaDeltaOutput,
-                         sizeof(otaDeltaOutput), &outputLength) ||
+                         kOtaDeltaBlockBytes, &outputLength) ||
         outputLength != otaDeltaOutputLength) return false;
   } else if (otaDeltaRecordType == 2) {
     if (otaDeltaPayloadLength != otaDeltaOutputLength) return false;
@@ -917,6 +969,24 @@ void beginUpdate(const Message& message) {
     targetPartition = nullptr;
     setStatus("ERROR|FLASH_PARTITION"); return;
   }
+#if MIMIVENT_ENABLE_WIFI && MIMIVENT_WIFI_TLS_PROBE
+  wifiTlsResourceProbeSuspendForOta();
+#endif
+#if MIMIVENT_ENABLE_WIFI && MIMIVENT_WIFI_READ_CONTROL
+  wifiHttpsServerSuspendForOta();
+#endif
+  bool memoryReady=prepareTransferMemory(packageMode, deltaMode);
+#if MIMIVENT_ENABLE_WIFI && MIMIVENT_WIFI_READ_CONTROL
+  if(!memoryReady){
+    // TLS/RF 生命周期后的碎片可能使大块不足；Flash 尚未开始写入，只重试一次。
+    wifiProvisioningSuspendForOta();
+    memoryReady=prepareTransferMemory(packageMode,deltaMode);
+  }
+#endif
+  if (!memoryReady) {
+    setStatus("ERROR|MEMORY");
+    return;
+  }
   esp_err_t beginResult;
   if (resumable) {
     beginResult = esp_ota_resume(targetPartition, OTA_WITH_SEQUENTIAL_WRITES,
@@ -942,6 +1012,7 @@ void beginUpdate(const Message& message) {
     imageHeaderBytes = 0;
   }
   if (beginResult != ESP_OK) {
+    releaseTransferMemory();
     targetPartition = nullptr;
     otaHandle = 0;
     setStatus("ERROR|FLASH_BEGIN"); return;
@@ -1241,8 +1312,9 @@ void processMessage(const Message& message) {
       setStatus(String("OFFSET|") + currentOffset);
       return;
     }
+    packageFailure="PACKAGE_BLOCK";
     if (!consumeOtaPackageBytes(payload, payloadLength)) {
-      abortUpdate("PACKAGE_BLOCK", true); return;
+      abortUpdate(packageFailure, true); return;
     }
     lastActivityAt = millis();
     setStatus(String("ACK|") + packageReceivedSize + "|" + expectedPackageSize + "|" +
@@ -1341,6 +1413,7 @@ void finishUpdate(uint16_t connection, const String& taskId) {
   mbedtls_sha256_finish(&shaContext, digest);
   mbedtls_sha256_free(&shaContext);
   active = false;
+  releaseTransferMemory();
   if (!digestToHex(digest).equalsIgnoreCase(expectedDigest)) {
     abortUpdate("HASH", true); return;
   }
@@ -1529,13 +1602,16 @@ void otaManagerOnConnect() {
 
 void otaManagerOnSecureSession(uint16_t connection) {
   if (connection == BLE_HS_CONN_HANDLE_NONE) return;
+  bool changed = false;
   portENTER_CRITICAL(&connectionStateMux);
   if (!active || ownerConnection == connection) {
+    changed = !authorized || authorizedConnection != connection;
     authorizedConnection = connection;
     authorized = true;
   }
   portEXIT_CRITICAL(&connectionStateMux);
-  Serial.printf("OTA authorized for bonded connection %u\n", connection);
+  // 数据包也会检查安全会话，仅在授权变化时记录，避免逐包阻塞串口。
+  if (changed) Serial.printf("OTA authorized for bonded connection %u\n", connection);
 }
 
 void otaManagerOnDisconnect(uint16_t connection) {

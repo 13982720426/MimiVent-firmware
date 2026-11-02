@@ -10,6 +10,7 @@
 #include "StatisticsConfig.h"
 #include "StatisticsTypes.h"
 #include "FirmwareVersion.h"
+#include "SettingsStore.h"
 
 namespace {
 
@@ -658,10 +659,15 @@ void statisticsStoreRecordAutoResume() {
   addEvent(kAutoResume, kComplete);
 }
 
-void statisticsStoreFanStarted(uint8_t kind, unsigned long nowMs) {
+void statisticsStoreFanStarted(uint8_t kind, unsigned long nowMs,
+                               uint16_t configuredSeconds) {
   if (!ready || kind == kActivity) return;
   (void)nowMs;
   addEvent(kind, kActive);
+  if (kind == kAutomatic && eventCount) {
+    events[eventCount - 1].reserved = configuredSeconds;
+    activeRun.reserved = configuredSeconds;
+  }
 }
 
 void statisticsStoreFanStopped(unsigned long durationMs) {
@@ -677,6 +683,25 @@ void statisticsStoreFanStopped(unsigned long durationMs) {
   activeRun = {};
   activeEventIndex = kEventCapacity;
   persist();
+}
+
+uint16_t countValidToilets(uint32_t start, uint32_t end, unsigned long activeRunMs) {
+  uint16_t count = 0;
+  for (size_t i = 0; i < eventCount; ++i) {
+    const EventRecord& event = events[i];
+    if (event.kind != kAutomatic || !eventInRange(event, start, end)) continue;
+    // reserved 保存开始时的设定排风秒数；旧记录没有该字段时使用当前正式配置的设定值。
+    const uint32_t configured = event.reserved
+        ? event.reserved
+        : settingsStoreGet(TimingProfile::PRODUCTION).autoExhaustMs / 1000UL;
+    if (!configured) continue;
+    const uint32_t effective = event.state == kActive &&
+            static_cast<size_t>(i) == activeEventIndex
+        ? activeRunMs / 1000UL
+        : event.durationSeconds;
+    if (effective * 2 >= configured) ++count;
+  }
+  return count;
 }
 
 String statisticsStoreBuildJson(const String& range, bool fanOn, unsigned long activeRunMs,
@@ -734,6 +759,7 @@ String statisticsStoreBuildJson(const String& range, bool fanOn, unsigned long a
   uint32_t eventStart = 0;
   uint32_t eventEnd = 0;
   uint32_t nextCursor = 0;
+  uint16_t toiletCount = countValidToilets(periodStart, periodEnd, activeRunMs);
   if (range == "today" || range == "yesterday") {
     // 今日和昨日都使用本地自然日边界；今日窗口从本地零点到本次响应时间。
     eventStart = range == "today" ? todayStart : periodStart;
@@ -760,7 +786,8 @@ String statisticsStoreBuildJson(const String& range, bool fanOn, unsigned long a
       "\",\"timeSynced\":" + String(statisticsStoreHasClock() ? "true" : "false") +
       ",\"active\":" + String(fanOn ? "true" : "false") +
       ",\"range\":\"" + range + "\",\"runtimeSeconds\":" + String(runtimeSeconds) +
-      ",\"activityCount\":" + String(activityCount) + ",\"automaticCount\":" + String(automaticCount) + ",\"bucketSeconds\":[";
+      ",\"activityCount\":" + String(activityCount) + ",\"automaticCount\":" + String(automaticCount) +
+      ",\"toiletCount\":" + String(toiletCount) + ",\"bucketSeconds\":[";
   for (uint8_t i = 0; i < bucketCount; ++i) { if (i) json += ','; json += String(buckets[i]); }
   json += "],\"events\":" + eventsJson;
   const bool eventsHasMore = static_cast<uint32_t>(eventOffset) + recentCount < eventTotal;

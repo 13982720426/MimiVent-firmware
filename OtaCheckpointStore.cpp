@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstring>
 #include <strings.h>
+#include <nvs.h>
 
 namespace {
 constexpr uint32_t kCheckpointMagic = 0x4D564F32UL;
@@ -86,7 +87,12 @@ bool OtaCheckpointStore::save(OtaCheckpoint* record, uint32_t imageOffset,
   next.packageOffset = packageOffset;
   next.checksum = recordChecksum(next);
   const char* key = (next.sequence & 1U) ? "cp1" : "cp0";
-  if (preferences.putBytes(key, &next, sizeof(next)) != sizeof(next)) return false;
+  if (preferences.putBytes(key, &next, sizeof(next)) != sizeof(next)) {
+    nvs_stats_t stats{};nvs_get_stats(nullptr,&stats);
+    Serial.printf("[ota-checkpoint] write-failed imageOffset=%lu recordBytes=%u nvs-used=%u nvs-free=%u\n",
+        (unsigned long)imageOffset,sizeof(next),stats.used_entries,stats.free_entries);
+    return false;
+  }
   *record = next;
   return true;
 }

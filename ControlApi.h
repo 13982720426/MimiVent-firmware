@@ -31,6 +31,10 @@ struct ControlApiResponse {
   String body;
 };
 
+// 初始化 BLE/HTTP 共享的控制互斥锁；必须在任务启动前调用。
+void controlApiBegin();
+void controlApiLock();
+void controlApiUnlock();
 // 分发通用控制请求。所有状态变更、校验和错误响应集中在此处。
 ControlApiResponse controlApiDispatch(const ControlApiRequest& request);
 // 将 HTTP 表单/BLE 协议中的毫秒值严格解析为当前配置允许的时间选项。

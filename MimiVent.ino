@@ -17,8 +17,18 @@
 #include "SettingsStore.h"
 #include "StatisticsStore.h"
 #include "OtaManager.h"
+#include "ControlApi.h"
+#include "WifiTlsResourceProbe.h"
+#include "WifiDeviceIdentity.h"
+#include "WifiHttpsServer.h"
 #include <esp_partition.h>
 #include <esp_ota_ops.h>
+
+#if MIMIVENT_ENABLE_WIFI && (MIMIVENT_WIFI_TLS_PROBE || MIMIVENT_WIFI_READ_CONTROL)
+// P3 实测镜像查询/验签调用链在 8 KiB loop 栈下仅余约 596 B。
+// 仅实验构建增加 2 KiB，重新测量堆余量后再决定生产配置。
+SET_LOOP_TASK_STACK_SIZE(10240);
+#endif
 
 // Arduino-ESP32 默认在 initArduino() 中无条件确认新镜像；延后到 setup 完整启动后再确认，
 // 让启动早期崩溃仍可由 ESP-IDF 回滚到原应用槽。
@@ -26,7 +36,13 @@ extern "C" bool verifyRollbackLater(void) { return true; }
 
 void setup() {
   Serial.begin(115200);
+#if ARDUINO_USB_CDC_ON_BOOT && ARDUINO_USB_MODE
+  // USB 接着但主机未读取时，诊断日志不能阻塞 NimBLE 回调或主循环。
+  // 缓冲满则丢弃本次输出；正常控制不依赖串口监听器在线。
+  Serial.setTxTimeoutMs(0);
+#endif
 
+  controlApiBegin();
   settingsStoreBegin();
   // 先把继电器输出设为关闭，避免 SPIFFS 挂载/校验期间继电器输入悬空。
   fanControllerBegin();
@@ -34,6 +50,15 @@ void setup() {
   statusLedBegin();
   otaManagerBegin();
 
+#if MIMIVENT_ENABLE_WIFI && (MIMIVENT_WIFI_IDENTITY_PROBE || MIMIVENT_WIFI_READ_CONTROL)
+  wifiDeviceIdentityBegin();
+#endif
+#if MIMIVENT_ENABLE_WIFI && MIMIVENT_WIFI_READ_CONTROL
+  wifiBindingBegin();
+#endif
+#if MIMIVENT_ENABLE_WIFI && MIMIVENT_WIFI_TLS_PROBE
+  wifiTlsResourceProbeBegin();
+#endif
   bluetoothManagerBegin();
   otaManagerConfirmBoot();
 
@@ -81,12 +106,20 @@ void setup() {
 }
 
 void loop() {
+#if MIMIVENT_ENABLE_WIFI && MIMIVENT_WIFI_READ_CONTROL
+  wifiHttpsServerUpdate();
+#endif
   // 先处理 BLE 命令，再读取时钟。命令处理器可能刚设置 overrideStartedMs；
   // 若使用处理请求之前保存的 nowMs，unsigned 差值会下溢并让定时模式立即到期。
   bluetoothManagerUpdate();
+#if MIMIVENT_ENABLE_WIFI && MIMIVENT_WIFI_TLS_PROBE
+  wifiTlsResourceProbeUpdate();
+#endif
 
   const unsigned long nowMs = millis();
+  controlApiLock();
   fanControllerUpdate(nowMs);
+  controlApiUnlock();
 
   static unsigned long lastStatusLedUpdateMs = 0;
   if (nowMs - lastStatusLedUpdateMs >= 20UL) {

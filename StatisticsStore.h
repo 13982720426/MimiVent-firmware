@@ -15,7 +15,8 @@ void statisticsStoreRecordActivity();
 void statisticsStoreRecordTimedPause(unsigned long durationMs);
 void statisticsStoreRecordLockedOff();
 void statisticsStoreRecordAutoResume();
-void statisticsStoreFanStarted(uint8_t kind, unsigned long nowMs);
+void statisticsStoreFanStarted(uint8_t kind, unsigned long nowMs,
+                               uint16_t configuredSeconds = 0);
 void statisticsStoreFanStopped(unsigned long durationMs);
 String statisticsStoreBuildJson(const String& range, bool fanOn, unsigned long activeRunMs,
                                 uint16_t eventOffset = 0);

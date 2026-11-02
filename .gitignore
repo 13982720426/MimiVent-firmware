@@ -8,3 +8,5 @@ build/
 *.elf
 *.bin
 *.map
+.codegraph/
+__pycache__/

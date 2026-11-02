@@ -3,6 +3,7 @@
 
 #include <NimBLEDevice.h>
 
+#include <algorithm>
 #include <cstring>
 
 #include "AppConfig.h"
@@ -11,6 +12,7 @@
 #include "SettingsStore.h"
 #include "OtaManager.h"
 #include "OtaBleAdapter.h"
+#include "WifiProvisioningManager.h"
 
 namespace {
 
@@ -21,6 +23,7 @@ constexpr size_t kFirstFrameHeaderSize = 12;
 constexpr uint16_t kMinimumAttMtu = 23;
 // 先保留保守发送节奏；每包大小按实际协商 MTU 计算。
 constexpr unsigned long kResponseChunkIntervalMs = 20UL;
+constexpr size_t kWifiRequestBufferSize = 512;
 
 NimBLEServer* bleServer = nullptr;
 NimBLECharacteristic* responseCharacteristic = nullptr;
@@ -38,7 +41,28 @@ String queuedResponse;
 bool queuedResponseLegacy = false;
 size_t queuedResponseOffset = 0;
 unsigned long lastResponseChunkMs = 0;
+unsigned long responseQueuedMs = 0;
+unsigned long responseLastProgressMs = 0;
+uint16_t responseNotifyFailures = 0;
 uint16_t queuedResponseChunkCount = 0;
+NimBLECharacteristic* wifiResponseCharacteristic = nullptr;
+char pendingWifiRequest[kWifiRequestBufferSize] = {};
+uint16_t pendingWifiRequestId = 0;
+bool wifiRequestPending = false;
+bool wifiRequestEncrypted = false;
+char pendingWifiOwner[18]{};
+volatile uint32_t wifiGeneration=0;
+uint32_t pendingWifiGeneration=0,responseWifiGeneration=0;
+bool wifiResponseBusy = false;
+portMUX_TYPE wifiRequestMux = portMUX_INITIALIZER_UNLOCKED;
+String queuedWifiResponse;
+size_t queuedWifiResponseOffset = 0;
+uint16_t queuedWifiResponseChunkCount = 0;
+uint16_t activeWifiRequestId = 0;
+unsigned long lastWifiResponseChunkMs = 0;
+unsigned long wifiResponseQueuedMs = 0;
+unsigned long wifiResponseLastProgressMs = 0;
+uint16_t wifiResponseNotifyFailures = 0;
 
 String fieldAt(const String& packet, uint8_t wantedIndex, uint8_t* nextOffset) {
   uint8_t start = 0;
@@ -142,13 +166,26 @@ void queueResponse(const ControlApiResponse& response, uint16_t requestId,
   activeRequestId = requestId;
   queuedResponseOffset = 0;
   queuedResponseChunkCount = 0;
+  responseQueuedMs = millis();
+  responseLastProgressMs = responseQueuedMs;
+  responseNotifyFailures = 0;
   portENTER_CRITICAL(&requestMux);
   responseBusy = true;
   portEXIT_CRITICAL(&requestMux);
 }
 
 void sendNextResponseChunk(unsigned long nowMs) {
-  if (!clientConnected || !queuedResponse.length()) return;
+  if (!clientConnected || !queuedResponse.length()) {
+    if (responseBusy || queuedResponse.length()) {
+      queuedResponse = "";
+      queuedResponseOffset = 0;
+      responseNotifyFailures = 0;
+      portENTER_CRITICAL(&requestMux);
+      responseBusy = false;
+      portEXIT_CRITICAL(&requestMux);
+    }
+    return;
+  }
   if (queuedResponseOffset && nowMs - lastResponseChunkMs < kResponseChunkIntervalMs) return;
 
   if (queuedResponseLegacy) {
@@ -157,9 +194,25 @@ void sendNextResponseChunk(unsigned long nowMs) {
     const size_t payloadLength = remaining < mtuPayload ? remaining : mtuPayload;
     if (!responseCharacteristic->notify(
             reinterpret_cast<const uint8_t*>(queuedResponse.c_str() + queuedResponseOffset),
-            payloadLength)) return;
+            payloadLength)) {
+      ++responseNotifyFailures;
+      if (nowMs - responseLastProgressMs > 2000UL || responseNotifyFailures >= 20) {
+        Serial.printf("BLE notification failed, dropping response request=%u failures=%u\n",
+                      activeRequestId, responseNotifyFailures);
+        queuedResponse = "";
+        queuedResponseOffset = 0;
+        queuedResponseChunkCount = 0;
+        responseNotifyFailures = 0;
+        portENTER_CRITICAL(&requestMux);
+        responseBusy = false;
+        portEXIT_CRITICAL(&requestMux);
+      }
+      return;
+    }
     queuedResponseOffset += payloadLength;
     lastResponseChunkMs = nowMs;
+    responseLastProgressMs = nowMs;
+    responseNotifyFailures = 0;
     if (queuedResponseOffset >= queuedResponse.length()) {
       queuedResponse = "";
       queuedResponseOffset = 0;
@@ -201,10 +254,26 @@ void sendNextResponseChunk(unsigned long nowMs) {
   }
   memcpy(frame + frameLength, queuedResponse.c_str() + queuedResponseOffset, payloadLength);
   frameLength += payloadLength;
-  if (!responseCharacteristic->notify(frame, frameLength)) return;
+  if (!responseCharacteristic->notify(frame, frameLength)) {
+    ++responseNotifyFailures;
+    if (nowMs - responseLastProgressMs > 2000UL || responseNotifyFailures >= 20) {
+      Serial.printf("BLE notification failed, dropping response request=%u failures=%u\n",
+                    activeRequestId, responseNotifyFailures);
+      queuedResponse = "";
+      queuedResponseOffset = 0;
+      queuedResponseChunkCount = 0;
+      responseNotifyFailures = 0;
+      portENTER_CRITICAL(&requestMux);
+      responseBusy = false;
+      portEXIT_CRITICAL(&requestMux);
+    }
+    return;
+  }
   queuedResponseOffset += payloadLength;
   ++queuedResponseChunkCount;
   lastResponseChunkMs = nowMs;
+  responseLastProgressMs = nowMs;
+  responseNotifyFailures = 0;
   if (queuedResponseOffset >= queuedResponse.length()) {
     Serial.printf("BLE response sent: request=%u, fragments=%u, mtu=%u, bytes=%u\n",
                   activeRequestId, queuedResponseChunkCount, peerMtu,
@@ -217,15 +286,112 @@ void sendNextResponseChunk(unsigned long nowMs) {
   }
 }
 
+void queueWifiResponse(uint16_t requestId, uint16_t statusCode,
+                       const String& body) {
+  queuedWifiResponse = String(statusCode) + '\n' + body + '\n';
+  queuedWifiResponseOffset = 0;
+  queuedWifiResponseChunkCount = 0;
+  activeWifiRequestId = requestId;
+  wifiResponseQueuedMs = millis();
+  wifiResponseLastProgressMs = wifiResponseQueuedMs;
+  wifiResponseNotifyFailures = 0;
+  portENTER_CRITICAL(&wifiRequestMux);
+  wifiResponseBusy = true;
+  portEXIT_CRITICAL(&wifiRequestMux);
+}
+
+void sendNextWifiResponseChunk(unsigned long nowMs) {
+  if (!clientConnected || !wifiResponseCharacteristic ||
+      !queuedWifiResponse.length()) {
+    if (wifiResponseBusy || queuedWifiResponse.length()) {
+      queuedWifiResponse = "";
+      queuedWifiResponseOffset = 0;
+      wifiResponseNotifyFailures = 0;
+      portENTER_CRITICAL(&wifiRequestMux);
+      wifiResponseBusy = false;
+      portEXIT_CRITICAL(&wifiRequestMux);
+    }
+    return;
+  }
+  if (queuedWifiResponseOffset &&
+      nowMs - lastWifiResponseChunkMs < kResponseChunkIntervalMs) return;
+  const size_t mtuPayload = peerMtu > 3 ? peerMtu - 3 : kMinimumAttMtu - 3;
+  const bool first = queuedWifiResponseOffset == 0;
+  const size_t headerSize = first ? kFirstFrameHeaderSize : kFramePrefixSize;
+  if (mtuPayload <= headerSize || queuedWifiResponse.length() > 0xFFFFU) {
+    queuedWifiResponse = "";
+    return;
+  }
+  const size_t available = mtuPayload - headerSize;
+  const size_t remaining = queuedWifiResponse.length() - queuedWifiResponseOffset;
+  const size_t payloadLength = std::min(available, remaining);
+  uint8_t frame[517] = {};
+  writeU16(frame, activeWifiRequestId);
+  writeU16(frame + 2, queuedWifiResponseChunkCount);
+  size_t frameLength = kFramePrefixSize;
+  if (first) {
+    frame[4] = kBleFrameVersion;
+    frame[5] = 0;
+    writeU16(frame + 6, static_cast<uint16_t>(queuedWifiResponse.length()));
+    writeU32(frame + 8,
+             crc32(reinterpret_cast<const uint8_t*>(queuedWifiResponse.c_str()),
+                   queuedWifiResponse.length()));
+    frameLength = kFirstFrameHeaderSize;
+  }
+  memcpy(frame + frameLength,
+         queuedWifiResponse.c_str() + queuedWifiResponseOffset, payloadLength);
+  frameLength += payloadLength;
+  if (!wifiResponseCharacteristic->notify(frame, frameLength)) {
+    ++wifiResponseNotifyFailures;
+    if (nowMs - wifiResponseLastProgressMs > 2000UL || wifiResponseNotifyFailures >= 20) {
+      Serial.printf("WiFi BLE notification failed, dropping response request=%u failures=%u\n",
+                    activeWifiRequestId, wifiResponseNotifyFailures);
+      queuedWifiResponse = "";
+      queuedWifiResponseOffset = 0;
+      queuedWifiResponseChunkCount = 0;
+      wifiResponseNotifyFailures = 0;
+      portENTER_CRITICAL(&wifiRequestMux);
+      wifiResponseBusy = false;
+      portEXIT_CRITICAL(&wifiRequestMux);
+    }
+    return;
+  }
+  queuedWifiResponseOffset += payloadLength;
+  ++queuedWifiResponseChunkCount;
+  lastWifiResponseChunkMs = nowMs;
+  wifiResponseLastProgressMs = nowMs;
+  wifiResponseNotifyFailures = 0;
+  if (queuedWifiResponseOffset >= queuedWifiResponse.length()) {
+    queuedWifiResponse = "";
+    queuedWifiResponseOffset = 0;
+    queuedWifiResponseChunkCount = 0;
+    portENTER_CRITICAL(&wifiRequestMux);
+    wifiResponseBusy = false;
+    portEXIT_CRITICAL(&wifiRequestMux);
+  }
+}
+
 class ServerCallbacks final : public NimBLEServerCallbacks {
-  void onConnect(NimBLEServer*, NimBLEConnInfo&) override {
+  void onConnect(NimBLEServer*, NimBLEConnInfo& info) override {
+    portENTER_CRITICAL(&wifiRequestMux);++wifiGeneration;wifiRequestPending=false;portEXIT_CRITICAL(&wifiRequestMux);
     clientConnected = true;
     peerMtu = kMinimumAttMtu;
     OtaBleAdapter::setNegotiatedMtu(peerMtu);
     otaManagerOnConnect();
     Serial.println("BLE client connected");
+#if defined(MIMIVENT_BLE_PAIRING_PROBE) && MIMIVENT_BLE_PAIRING_PROBE
+    // 仅电脑配对诊断构建主动协商；普通连接不因此强制配对。
+    int result = 0;
+    const bool started = NimBLEDevice::startSecurity(info.getConnHandle(), &result);
+    Serial.printf("[ble-pairing-probe] requested=%d result=%d\n", started, result);
+#endif
+  }
+  void onAuthenticationComplete(NimBLEConnInfo& info) override {
+    Serial.printf("BLE security complete; encrypted=%d bonded=%d authenticated=%d\n",
+                  info.isEncrypted(), info.isBonded(), info.isAuthenticated());
   }
   void onDisconnect(NimBLEServer*, NimBLEConnInfo& info, int reason) override {
+    portENTER_CRITICAL(&wifiRequestMux);++wifiGeneration;wifiRequestPending=false;portEXIT_CRITICAL(&wifiRequestMux);
     clientConnected = false;
     otaManagerOnDisconnect(info.getConnHandle());
     Serial.printf("BLE client disconnected; reason=0x%02X\n", reason);
@@ -270,6 +436,32 @@ class CommandCallbacks final : public NimBLECharacteristicCallbacks {
   }
 };
 
+class WifiCommandCallbacks final : public NimBLECharacteristicCallbacks {
+  void onWrite(NimBLECharacteristic* characteristic, NimBLEConnInfo& info) override {
+    const NimBLEAttValue incoming = characteristic->getValue();
+    if (!info.isEncrypted() || !info.isBonded() || incoming.size() < 3 ||
+        incoming.size() >= kWifiRequestBufferSize) return;
+    const uint8_t* bytes = incoming.data();
+    const size_t requestLength = incoming.size() - 2;
+    String owner=info.getIdAddress().toString().c_str();
+    owner.replace(":","");owner.toLowerCase();
+    // 区分 public/random 身份地址；同一 MAC 的不同类型不是同一个 bond。
+    owner=String(info.getIdAddress().getType()&1)+"-"+owner;
+    portENTER_CRITICAL(&wifiRequestMux);
+    if (!wifiRequestPending && !wifiResponseBusy) {
+      pendingWifiRequestId = static_cast<uint16_t>(bytes[0]) |
+          (static_cast<uint16_t>(bytes[1]) << 8U);
+      memcpy(pendingWifiRequest, bytes + 2, requestLength);
+      pendingWifiRequest[requestLength] = '\0';
+      wifiRequestEncrypted = true;
+      strncpy(pendingWifiOwner,owner.c_str(),sizeof(pendingWifiOwner)-1);
+      pendingWifiGeneration=wifiGeneration;
+      wifiRequestPending = true;
+    }
+    portEXIT_CRITICAL(&wifiRequestMux);
+  }
+};
+
 }  // namespace
 
 void bluetoothManagerBegin() {
@@ -295,17 +487,50 @@ void bluetoothManagerBegin() {
   OtaBleAdapter::registerService(service);
   service->start();
 
+  NimBLEService* wifiService = nullptr;
+#if MIMIVENT_ENABLE_WIFI
+  wifiService = bleServer->createService(AppConfig::kBleWifiServiceUuid);
+  NimBLECharacteristic* wifiCommand = wifiService->createCharacteristic(
+      AppConfig::kBleWifiCommandUuid,
+      NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_ENC);
+  wifiCommand->setCallbacks(new WifiCommandCallbacks());
+  wifiResponseCharacteristic = wifiService->createCharacteristic(
+      AppConfig::kBleWifiResponseUuid,
+      NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::READ_ENC | NIMBLE_PROPERTY::NOTIFY,
+      1024);
+  wifiResponseCharacteristic->setValue("{}");
+  wifiService->start();
+  wifiProvisioningBegin();
+#endif
+
   NimBLEAdvertising* advertising = NimBLEDevice::getAdvertising();
-  // 主广播包含服务 UUID；名称放入扫描响应，避免首次发现时只显示 BLE 地址。
-  advertising->enableScanResponse(true);
-  advertising->setName(AppConfig::kBleDeviceName);
-  advertising->addServiceUUID(AppConfig::kBleServiceUuid);
+  NimBLEAdvertisementData advertisementData;
+  advertisementData.setFlags(0x06);
+  advertisementData.addServiceUUID(AppConfig::kBleServiceUuid);
+  NimBLEAdvertisementData scanResponseData;
+#if MIMIVENT_ENABLE_WIFI
+  const uint8_t gattVersion = 2;
+  scanResponseData.setServiceData(
+      NimBLEUUID(AppConfig::kBleServiceUuid), &gattVersion, sizeof(gattVersion));
+#else
+  const uint8_t gattVersion = 1;
+  scanResponseData.setServiceData(
+      NimBLEUUID(AppConfig::kBleServiceUuid), &gattVersion, sizeof(gattVersion));
+#endif
+  scanResponseData.setName(AppConfig::kBleDeviceName);
+  if (!advertising->setAdvertisementData(advertisementData) ||
+      !advertising->setScanResponseData(scanResponseData)) {
+    Serial.println("BLE advertising payload exceeds the 31-byte legacy limit");
+  }
   advertising->start();
   Serial.printf("BLE control ready: %s\n", AppConfig::kBleDeviceName);
 }
 
 void bluetoothManagerUpdate() {
   otaManagerUpdate();
+#if MIMIVENT_ENABLE_WIFI
+  wifiProvisioningUpdate();
+#endif
   if (!clientConnected && wasClientConnected) {
     bleServer->startAdvertising();
     wasClientConnected = false;
@@ -352,5 +577,36 @@ void bluetoothManagerUpdate() {
     }
     queueResponse(result, localRequestId, legacyRequest);
   }
+#if MIMIVENT_ENABLE_WIFI
+  char localWifiRequest[kWifiRequestBufferSize] = {};
+  char localWifiOwner[18]{};uint32_t requestGeneration=0;
+  uint16_t localWifiRequestId = 0;
+  bool hasWifiRequest = false;
+  bool wifiRequestWasEncrypted = false;
+  portENTER_CRITICAL(&wifiRequestMux);
+  if (wifiRequestPending) {
+    memcpy(localWifiRequest, pendingWifiRequest, sizeof(localWifiRequest));
+    localWifiRequestId = pendingWifiRequestId;
+    wifiRequestWasEncrypted = wifiRequestEncrypted;
+    memcpy(localWifiOwner,pendingWifiOwner,sizeof(localWifiOwner));requestGeneration=pendingWifiGeneration;
+    pendingWifiRequest[0] = '\0';
+    wifiRequestPending = false;
+    wifiRequestEncrypted = false;
+    hasWifiRequest = true;
+  }
+  portEXIT_CRITICAL(&wifiRequestMux);
+  if (hasWifiRequest && clientConnected && requestGeneration==wifiGeneration) {
+    const String body = wifiRequestWasEncrypted
+        ? wifiProvisioningHandleRequest(String(localWifiRequest),String(localWifiOwner))
+        : String("{\"error\":\"PAIRING_REQUIRED\"}");
+    queueWifiResponse(localWifiRequestId, 200, body);
+    responseWifiGeneration=requestGeneration;
+  }
+  if(responseWifiGeneration!=wifiGeneration){
+    queuedWifiResponse="";queuedWifiResponseOffset=0;
+    portENTER_CRITICAL(&wifiRequestMux);wifiResponseBusy=false;portEXIT_CRITICAL(&wifiRequestMux);
+  }
+  sendNextWifiResponseChunk(millis());
+#endif
   sendNextResponseChunk(millis());
 }

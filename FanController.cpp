@@ -29,7 +29,8 @@ void setFan(bool turnOn, unsigned long nowMs) {
     uint8_t kind = 3;  // 临时排风
     if (controlMode == ControlMode::AUTO && autoPhase == AutoPhase::EXHAUSTING) kind = 2;
     else if (controlMode == ControlMode::FORCE_TEST) kind = 4;
-    statisticsStoreFanStarted(kind, nowMs);
+    statisticsStoreFanStarted(kind, nowMs,
+        kind == 2 ? static_cast<uint16_t>(phaseDurationMs / 1000UL) : 0);
   } else {
     statisticsStoreFanStopped(nowMs - fanStartedMs);
   }

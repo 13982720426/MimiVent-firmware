@@ -1,6 +1,6 @@
 # MimiVent
 
-ESP32-C3-DevKitM-1 单猫砂盆自动排风固件，通过 MimiVent App 的 BLE 控制设备。当前基础方案使用 **1 个猫砂盆、1 个 PIR、1 台风机**；设备开机后先执行启动冷静期，再进入 PIR 自动感应。手机页面可查看 PIR/风机状态，临时强制开/关均可设定时长，另有需要二次确认的持续关闭锁。三通、第二段支管和第二个 PIR 是连接第二个猫砂盆时才需要的可选扩展，不属于当前基础方案的必需配件。当前发布固件版本为 `v0.4.0`；上一个正式版本为 `v0.3.1`。
+ESP32-C3-DevKitM-1 单猫砂盆自动排风固件，通过 MimiVent App 的 BLE 或 WiFi 控制设备。当前基础方案使用 **1 个猫砂盆、1 个 PIR、1 台风机**；设备开机后先执行启动冷静期，再进入 PIR 自动感应。手机页面可查看 PIR/风机状态，临时强制开/关均可设定时长，另有需要二次确认的持续关闭锁。三通、第二段支管和第二个 PIR 是连接第二个猫砂盆时才需要的可选扩展，不属于当前基础方案的必需配件。当前固件版本为 `v0.5.0`，配套 App `v0.5.0`；上一正式固件为 `v0.4.0`。WiFi 配网与 HTTPS 控制已完成用户真机验证。变化见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 项目启动前准备
 
@@ -33,8 +33,8 @@ ESP32-C3-DevKitM-1 单猫砂盆自动排风固件，通过 MimiVent App 的 BLE 
 
 - macOS、Windows 或 Linux 均可开发；Arduino IDE 2.x 可用于编辑、编译和烧录。本项目不要求 Windows。
 - 需要安装的软件：Arduino IDE 2.x、Espressif Systems 的 `esp32` 板卡包、`Adafruit NeoPixel` 库、`NimBLE-Arduino` 库。
-- `WiFi`、`WebServer` 和 `Preferences`（NVS 配置存储）库由 ESP32 Arduino core 自带，不要在 Library Manager 里另外安装同名库。
-- 当前构建组合：Arduino IDE 2.3.10、ESP32 Arduino core `esp32:esp32` 3.3.12、Adafruit NeoPixel 1.15.5、NimBLE-Arduino 2.5.1。v0.3.1 是上一个正式版本；v0.4.0 已通过 Arduino CLI 编译及 USB 烧录校验，并完成 BLE OTA 完整包/差分包、暂停续传、安装重连核验和任务放弃/替换真机验证。应用槽上限为 1,769,472 字节。
+- `WiFi`、ESP-IDF HTTPS/TLS 和 `Preferences`（NVS 配置存储）库由 ESP32 Arduino core 自带，不要在 Library Manager 里另外安装同名库。
+- 当前构建组合：Arduino IDE 2.3.10、ESP32 Arduino core `esp32:esp32` 3.3.12、Adafruit NeoPixel 1.15.5、NimBLE-Arduino 2.5.1。v0.4.0 已通过 Arduino CLI 编译及 USB 烧录校验，并完成 BLE OTA 完整包/差分包、暂停续传、安装重连核验和任务放弃/替换真机验证；v0.5.0 为 WiFi 功能版本，需与 App v0.5.0 配套。应用槽上限为 1,769,472 字节。
 - 将本仓库整个项目目录放在 Arduino sketchbook 下，保持目录名和主 `.ino` 文件名一致：`MimiVent/MimiVent.ino`。
 - 首次接线烧录时使用 USB 数据线连接开发板；在 IDE 中选择对应串口和 `ESP32C3 Dev Module` 板卡配置。
 
@@ -68,7 +68,7 @@ ESP32-C3-DevKitM-1 单猫砂盆自动排风固件，通过 MimiVent App 的 BLE 
 1. 用 USB 数据线连接 ESP32-C3-DevKitM-1。
 2. 从 IDE 顶部的开发板选择器中选择 **ESP32C3 Dev Module**。如果列表中没有该选项，先确认 Espressif `esp32` 板卡包已经安装完成。
 3. 在 **Tools（工具）** 菜单确认板型为 `ESP32C3 Dev Module`，选择开发板插入后出现的 **Port（端口）**。端口名称因操作系统和 USB 转串口芯片而异；不确定时可拔插开发板，观察哪个端口随之消失/出现。
-4. 本项目使用板载 4MB Flash。已验证的 `v0.3.1` 使用 `Minimal SPIFFS (1.9MB APP with OTA/128KB SPIFFS)`。当前工作树使用项目根目录的 `partitions.csv`，包含双 OTA 应用槽和 512 KiB 统计分区。已用 Arduino CLI 指定此表并覆盖应用最大尺寸完成编译验证；Arduino IDE GUI 的自定义分区表选择尚未验证。烧录前必须确认实际上传使用这份分区表，否则不能保证 OTA 与统计分区布局匹配。若工具菜单显示 **Flash Size（闪存大小）**，选择 `4MB (32Mb)`。
+4. 本项目使用板载 4MB Flash。当前版本使用根目录的 `partitions.csv`，包含双 OTA 应用槽和 512 KiB 统计分区；不要改用旧版 `Minimal SPIFFS` 或默认分区。完整 WiFi 版本还依赖项目隔离的 TLS 4 KiB SDK 副本，推荐使用下方构建脚本；IDE 默认编译不会自动启用本版 WiFi 构建参数。若工具菜单显示 **Flash Size（闪存大小）**，选择 `4MB (32Mb)`。
 
 ### 接线前安全检查
 
@@ -138,38 +138,67 @@ DCP3512 GND ─────────────── ESP32 GND、PIR GND
 | GPIO3 | 未使用 | 预留给未来第二个 PIR；当前不接入、不参与控制。 |
 | 3V3 / GND | 控制侧供电与公共地 | 不要将 12V 接入这些引脚。 |
 
-## 从零编译与烧录
+## 编译与 USB 烧录
 
-1. 按照“软件与开发环境”一节安装 Arduino IDE、Espressif `esp32` 板卡包、Adafruit `Adafruit NeoPixel` 和 NimBLE-Arduino 库。
-2. 在 Finder/文件管理器中打开项目目录，并用 Arduino IDE 打开 `MimiVent.ino`。确认主 `.ino` 文件仍位于同名 `MimiVent` 文件夹内。
-3. 连接开发板，选择 `ESP32C3 Dev Module` 和对应 USB 串口。
-4. 点击左上角 **Verify（验证/编译，勾号）**。首次编译会下载/准备 ESP32 构建工具，可能比后续编译花更久；等待输出区出现编译成功信息。
-5. 编译成功后点击 **Upload（上传，右箭头）**。上传失败且提示连接超时时，按住板上的 `BOOT`，点击上传，在 IDE 开始连接/写入时松开；不同开发板的进入下载模式操作可能略有差异。
-6. 上传完成后打开 **Serial Monitor（串口监视器）**，将波特率设为 `115200`，按一次 `RST`。启动日志应包含固件版本、BLE 设备名和时序模式。
-7. 安装 MimiVent App，通过 BLE 连接设备，检查状态、控制和统计功能。
+依赖 ESP32 Arduino core `3.3.12`、Adafruit NeoPixel `1.15.5`、NimBLE-Arduino `2.5.1`。根目录 `partitions.csv` 为实际分区依据：两个各 `0x1B0000`（1,769,472 字节）的 OTA 应用槽和 `0x80000`（512 KiB）统计分区。菜单中的 `huge_app` 只用于构建配置，不代表改用其默认无 OTA 分区表。
 
-也可使用 Arduino CLI 编译：
+完整 WiFi 控制构建使用项目脚本的 **`read4k`** 模式。名称沿用早期阶段命名，当前已包含 WiFi 写控制和统计，不能据此理解为只读。脚本默认 `off`；直接使用默认 Arduino 编译不会启用完整 WiFi 功能。
 
 ```sh
-arduino-cli compile --fqbn esp32:esp32:esp32c3:PartitionScheme=huge_app --build-property upload.maximum_size=1769472 MimiVent.ino
+bash scripts/build_firmware.sh read4k
 ```
 
-如使用 CLI，需先安装对应 ESP32 core、`Adafruit NeoPixel` 和 `NimBLE-Arduino` 库，并在项目根目录运行。ESP32 core 会优先把 sketch 同目录的 `partitions.csv` 复制为本次构建分区表；`huge_app` 用于选择支持大应用槽的构建配置，`upload.maximum_size` 与本项目 0x1B0000 应用槽一致。串口上传需使用同一 FQBN 并把端口替换为本机实际值，例如：
+输出为 `build/firmware-wifi-read4k/MimiVent.ino.bin`，脚本输出实际字节数及 SHA-256。必须确认镜像不超过 1,769,472 字节，并检查构建目录中的 `partitions.csv` 与仓库一致。
+
+此模式启用 `MIMIVENT_ENABLE_WIFI=1`、`MIMIVENT_WIFI_READ_CONTROL=1` 和动态 OTA 工作区，并使用 `build/sdk-tls-4096` 中的隔离 SDK。该目录不入库，新环境必须先准备：
+
+1. 取得脚本锁定的 mbedTLS 官方源码归档 `9d669eadb1955d348986b9280156710aaaadf79f`，存为 `build/mbedtls-9d669ead.tar.gz` 并解压为 `build/mbedtls-9d669eadb1955d348986b9280156710aaaadf79f`。
+2. 指定本机 ESP32-C3 SDK 与工具链目录，生成副本；脚本核对源码 SHA-256、SDK 版本和头文件，不修改全局 SDK。锁定 ESP-IDF `v5.5.5 b774170ff46`，不可混用其他 core 的库。
 
 ```sh
-arduino-cli upload --fqbn esp32:esp32:esp32c3:PartitionScheme=huge_app --build-property upload.maximum_size=1769472 --port /dev/cu.usbmodemXXXX MimiVent.ino
+python3 scripts/build_tls_sdk_overlay.py \
+  --sdk /path/to/esp32c3-sdk \
+  --toolchain /path/to/riscv32-esp-elf-toolchain \
+  --content-bytes 4096
+bash scripts/build_firmware.sh read4k
 ```
 
-当前统计版编译占用约 1.35 MB。项目自定义分区表为两个各 0x1B0000（1.6875 MiB）的 OTA 应用槽，以及 0x80000（512 KiB）的统计 SPIFFS 分区；两槽均容纳当前固件，仍保留 OTA。升级分区布局后首次启动会初始化统计文件系统；不要改回默认分区，否则 OTA 和统计文件布局不再匹配。
+`--toolchain` 指向直接包含 `riscv32-esp-elf-gcc` 的 `bin` 目录。具体校验与源码归档哈希以脚本为准；缺失副本或校验不符会停止构建，不能用其他模式冒充完整 WiFi 版本。
+
+连接开发板，选择实际串口后上传同一构建：
+
+```sh
+arduino-cli upload \
+  --fqbn esp32:esp32:esp32c3:PartitionScheme=huge_app,CDCOnBoot=cdc \
+  --port /dev/cu.usbmodemXXXX \
+  --input-dir build/firmware-wifi-read4k --verify MimiVent.ino
+```
+
+首次从旧分区布局迁移需经 USB 写入正确分区表；正常 OTA 不改分区表。不执行整片擦除，也不随意格式化统计分区。重启后检查串口版本、实际分区和下一 OTA 槽，随后验证 App 状态、控制、统计及网络恢复。
+
+仅 BLE 基线可用 `bash scripts/build_firmware.sh off` 编译。`on` 只启用配网，不等同完整 HTTPS 控制；`probe*`、`identity4k`、`pairprobe4k` 是诊断模式，不作为发布包。
+
+## BLE OTA 升级与签名
+
+App 菜单“固件升级”选择签名 `.mvota` 完整包，或基线镜像匹配的 `.mvdelta` 差分包；不直接上传原始 `.bin`。流程为选择 → 上传/续传 → 完整校验 → 用户确认安装 → 设备重启 → 重连核验版本与镜像身份，上传 100% 不代表最终完成。
+
+新镜像写入非运行 OTA 槽，分块 CRC 与整镜像 SHA-256 校验后验证 RSA-3072/PSS/SHA-256 发布者签名。未验证镜像不得切换启动槽。支持暂停、断连续传、任务查询/放弃/替换，安装提交后不能取消；允许兼容范围内受控降级，仍检查签名、目标芯片、分区与固件身份。
+
+升级、校验、安装期间停风并暂停普通业务；暂停、失败或等待用户安装时退出升级占用、恢复自动控制。实际回滚能力取决于对应构建的 bootloader 回滚配置及首次启动确认。
+
+签名私钥保留在仓库外，不放入 App 或设备。打包与密钥管理见 [固件签名](docs/ota-signing.md)。当前未启用硬件 Secure Boot，无线签名验证不等于防止物理改写 Flash。
+
+日常代码修改至少运行相应原生测试、目标模式 Arduino 构建及 `git diff --check`；涉及状态机/协议时补对应真机回归。仅改说明文档不需要重新刷机。
 
 ## 统计数据与同步
 
-- App 每次 BLE 连接后会把手机 Unix 时间和本地 UTC 偏移发送到设备。ESP32-C3 没有后备电池时钟；若本次开机期间尚未校时，事件会先以开机计时暂存，并在首次校时后回填。若在校时前再次断电，无法从设备本身还原这段时间对应的自然日，因此这些未校时事件不会计入日期统计。
-- PIR 活动沿、风机启动/停止等事件在发生时写入 SPIFFS 双槽快照；风机运行期间不会每秒写闪存。`/api/status` 可实时提供本轮运行时长，统计页约每 1 分钟刷新并显示进行中的运行时间；结束时保存最终时长和事件状态。
-- 每日汇总保留 30 天；事件明细最多保留 10 天，同时受当前 512 条容量上限约束，实际可查询范围以“时间保留期”和“最近 512 条”中较短者为准。活动、自动/临时/强制排风、临时暂停、持续关闭和手动恢复自动感应写入事件明细。临时暂停记录设定时长，提前恢复时另记恢复事件；持续关闭在手动恢复时记结束事件。设备重启时，未完成的排风记录标记为中断，未校时事件保留为无可信时间戳的记录，不能纳入按日期统计。
-- API：`POST /api/time` 校准手机时间；`GET /api/stats?mode=today|yesterday|threeDays|sevenDays` 返回汇总和时段桶。原始事件接口支持时间区间、事件类型筛选和 ID 游标分页；App 负责将连续感应事件合并为展示分组。当前固件仍使用 512 条固定容量和双槽快照持久化；文档中的追加式日志、紧凑多端点记录及完整 V2 查询/恢复语义尚未全部落地。不要把这份过渡实现视为统计 V2 方案完成，也不要假设升级会迁移旧统计数据。BLE 与 HTTP 共用现有统计查询逻辑。
-- `/api/status` 包含 `firmware` 与 `minimumAppVersion`；v0.4.0 要求 MimiVent App `v0.3.0` 或更新版本。控制接口最低兼容固件为 `v0.2.0`。App 以固件版本做兼容提示；低于推荐固件时会说明当前控制仍可用、哪些统计需要升级。
-- 统计数据保存在 SPIFFS（512 KiB），配置仍保存在 NVS。首次初始化空分区时会格式化并写入 NVS 初始化标记；已初始化过的分区若挂载失败，固件会禁用统计并保留分区现场，不会自动格式化历史数据。若需要手动恢复，应先备份统计分区，再执行明确的格式化操作。
+- BLE 与 WiFi 共用 `ControlApi` 及统计存储。App 经 BLE 连接后校准手机 Unix 时间和 UTC 偏移；首次可信校时后固定统计时区，按本地自然日查询。
+- 采用 schema 4、512 条事件上限和 SPIFFS 双槽快照；每日汇总保留 30 天，明细最多 10 天，亦受事件容量限制。事件淘汰后运行汇总仍可能存在，不能据此判定数据丢失或统计矛盾。
+- 运行汇总按小时累计，包含自动、临时、强制排风和当前运行；风机运行期间不每秒写 Flash，结束时保存最终时长。重启未完成运行标记为中断。
+- 未校时事件可在本次开机首次校时后回填；在校时前再次断电，无法还原可靠自然日。已初始化分区挂载失败时禁用统计并保留现场，不自动格式化历史数据。
+- `GET /api/stats?mode=today|yesterday|threeDays|sevenDays` 返回汇总和图表；`GET /api/events` 支持时间范围、类型筛选和事件 ID 游标分页。App 负责活动分组与展示。
+- `toiletCount` 按当前保留的自动排风记录估算：实际运行达到该次设定时长一半时计入，手动及强制排风不计入；新记录保存启动时设定，旧记录缺失时使用当前正式配置。它不是独立永久日计数，也不是实际人数测量，明细淘汰会影响可追溯范围。
+- 统计数据集由 `deviceId`、`dataEpoch`、`bootId` 标识。schema 4 的正常同格式升级不主动清空数据；更早不兼容格式的迁移行为应单独核对，不承诺任意历史格式无损升级。
 
 ## 首次上电与验证
 
@@ -190,9 +219,21 @@ arduino-cli upload --fqbn esp32:esp32:esp32c3:PartitionScheme=huge_app --build-p
 
 ## 蓝牙控制
 
-设备仅提供 BLE 控制。MimiVent App 通过 BLE 读取状态、配置时序、控制风机、校准时间、读取统计并执行 OTA。固件业务规则集中在 `ControlApi`，BLE 负责传输与协议解析；后续 Wi-Fi STA 控制应复用同一业务接口，不重新实现控制逻辑。
+设备提供 BLE 控制，并在 v0.5.0 起支持 WiFi STA 配网与 HTTPS 控制。MimiVent App 可通过 BLE 读取状态、配置时序、控制风机、校准时间、读取统计并执行 OTA；WiFi 通道复用同一 `ControlApi` 业务规则，不重新实现控制逻辑。
 
-设备不启动 SoftAP 或 HTTP 网页服务。正式版 v0.3.1 只有 BLE v1 控制通道，不包含 OTA GATT 通道；由于本版本还引入新的双 OTA 分区与统计分区布局，从 v0.3.1 首次升级到 v0.4.0 必须通过 USB 烧录。完成首刷后，后续固件可由 App 经 BLE OTA 升级。
+设备不启动 SoftAP 或内嵌网页控制台；v0.5.0 的 WiFi STA 仅提供 HTTPS API。正式版 v0.3.1 只有 BLE v1 控制通道，不包含 OTA GATT 通道；从 v0.3.1 首次升级到 v0.4.0 必须通过 USB 烧录，完成首刷后可由 App 经 BLE OTA 升级。
+
+## WiFi 配网与控制
+
+- App 经独立的安全 BLE 服务下发 WiFi 凭据；Android 手机搜索网络，设备不执行 WiFi 扫描，避免 BLE/WiFi 共存时内存不足。
+- 配网要求 BLE 已加密并 bonding。无屏设备采用系统配对，不执行 MITM 身份认证或自定义六位码验证；在可信设备附近操作。
+- 支持 2.4 GHz WPA2-Personal 与 WPA2/WPA3-Personal 混合网络；凭据保存在 NVS，开机恢复连接。App 不保存 WiFi 密码，日志不记录密码或完整配网正文。
+- HTTPS `8443` 提供状态、设置、控制、统计、事件与请求结果查询，使用设备证书固定和 Bearer token；不启动 SoftAP、明文 HTTP 或内嵌网页。
+- 绑定经安全 BLE 管理，设备最多保存两个有效客户端；支持待绑定、核验、幂等提交、撤销和清除全部绑定。清除绑定同时释放 WiFi 租约，不等于清除 WiFi 密码或全部设备数据。
+- 同时只有一份 WiFi 控制租约，空闲 20 秒过期，另一手机需等待释放/过期；BLE 控制与 WiFi 控制通过共享业务层协调。两份绑定不代表两路并行 WiFi 主控。
+- HTTPS 单连接、请求有界排队；写请求使用请求 ID 去重和结果查询，超时后先确认执行结果。
+- 校时仍经 BLE `/api/time` 完成，HTTPS 不提供该路由；断电重启后无可信时钟时，日期统计需等待校时。
+- OTA 仍只走 BLE。升级动态分配工作区，必要时释放 HTTPS 或暂停 WiFi 为 OTA 腾出内存，暂停/结束后恢复网络服务。
 
 ## 时序配置
 
@@ -208,52 +249,30 @@ arduino-cli upload --fqbn esp32:esp32:esp32c3:PartitionScheme=huge_app --build-p
 
 每项都可选择 0、5、10、20、30 秒或 1、2、3、5、10 分钟；只有离开确认时间支持 0。两套配置分别保存，改动后点击“保存设置”。“重置配置”会将当前环境五项时序恢复为表中默认值并立即保存。保存或重置不会重置正在进行的计时，从下一轮或下一次手动操作起使用新值。升级时会把旧固件内置的正式 1 分钟和 DEV 10 秒冷静期默认值迁移到新默认值；其他已自定义时长保留。
 
-设备上电或烧录后重启时，先进入启动冷静期并保持风机关闭，同时监测 PIR 电平但不执行自动排风。冷静期默认正式 30 秒、DEV 5 秒；普通临时排风和临时暂停在冷静期内不可启动。强制排风测试与持续关闭可以跳过冷静期：测试会取消剩余冷静期并按所选时长运行，结束后回到自动感应；持续关闭会取消冷静期并保持关闭，直到手动恢复自动感应。每次重启都默认进入正式配置；DEV 仅在本次开机期间有效。两套时序参数分别保存在 NVS，切换环境后按目标环境的冷静期重新计时。若浏览器仍停留在 `/dev`，页面会提示配置不一致并锁定操作，直到用户确认切换设备或打开正式页。
+设备上电或烧录后重启时，先进入启动冷静期并保持风机关闭，同时监测 PIR 电平但不执行自动排风。冷静期默认正式 30 秒、DEV 5 秒；普通临时排风和临时暂停在冷静期内不可启动。强制排风测试与持续关闭可以跳过冷静期：测试会取消剩余冷静期并按所选时长运行，结束后回到自动感应；持续关闭会取消冷静期并保持关闭，直到手动恢复自动感应。每次重启都默认进入正式配置；DEV 仅在本次开机期间有效。两套时序参数分别保存在 NVS，切换环境后按目标环境的冷静期重新计时。App 所选环境与设备不一致时会锁定控制，直到用户确认切换设备环境或让 App 跟随设备。
 
 PIR 模块自身输出 HIGH 的保持时间由模块电位器控制；软件离开确认时间从模块输出转为 LOW 后才开始计算。因此两者会共同决定猫离开后的实际等待时间。
 
 ## 建议的 BLE 联调顺序
 
-1. 第一次验证网页时，让风机 12V 正极保持断开并做好绝缘，给 ESP32、PIR 和继电器控制侧供电。
+1. 第一次验证控制时，让风机 12V 正极保持断开并做好绝缘，给 ESP32、PIR 和继电器控制侧供电。
 2. 手机打开 MimiVent App 并通过 BLE 连接设备，检查状态、PIR 状态和模式。
 3. 测试短时排风和暂停，确认到期后自动恢复感应；再测试持续关闭的二次确认和恢复自动感应。
 4. 断电后再接回风机正极，重新上电并通过 App 验证自动排风和延时停止。
 
 ## 固件模块
 
-主程序 `MimiVent.ino` 负责模块初始化和循环调度。`ControlApi` 维护业务规则，`BluetoothManager` 提供 BLE 控制，`OtaManager` 管理 OTA 任务和分区写入，`StatisticsStore` 管理统计存储。后续 Wi-Fi STA 只新增传输适配层并复用业务接口。
+主程序 `MimiVent.ino` 负责模块初始化和循环调度。`ControlApi` 维护业务规则，`BluetoothManager` 提供 BLE 控制，`WifiProvisioningManager`/`WifiHttpsServer` 提供 WiFi 配网与 HTTPS 控制，`OtaManager` 管理 OTA 任务和分区写入，`StatisticsStore` 管理统计存储；WiFi 传输适配层复用同一业务接口。
 
-## 版本管理
+## 版本与兼容性
 
-- 当前发布版本：`v0.4.0`；上一正式版本为 `v0.3.1`。`v0.1.0` 完成基础风机与本地网页实机验证；`v0.2.0` 增加 BLE 网页控制及 HTTP/BLE 共用时序输入校验；`v0.3.0` 增加设备统计、时间回填及 SPIFFS 数据保护；`v0.3.1` 增加通用原始事件筛选分页和控制事件恢复记录；v0.4.0 合并事件 ID 游标分页、本地自然日查询与 BLE OTA。
-- 版本号集中在 `FirmwareVersion.h`，页面和串口启动日志自动读取该版本。
-- 每次迭代在 `CHANGELOG.md` 记录功能变化；准备发布时同步更新版本号并创建 Git tag，例如 `v0.2.0`。
-- 使用 `MAJOR.MINOR.PATCH`：不兼容改动升 MAJOR；新增兼容功能升 MINOR；兼容性修复升 PATCH。
-
-## 编译
-
-`v0.4.0` 增加 BLE OTA。双 OTA 应用槽用于把新镜像写入非活动槽；校验成功后才切换启动槽。升级失败或中途断连时不会切换启动槽，设备继续从原固件启动。
-
-v0.4.0 起控制协议要求 MimiVent App `0.3.0` 或更新版本；旧 App 会收到 `APP_UPDATE_REQUIRED`，不会继续发送控制命令。由于应用槽与统计分区布局有变化，从旧分区表迁移必须先通过 USB 烧录；烧录后首次 OTA 才可经 BLE 执行。启动串口日志会列出实际分区表和下一 OTA 槽，刷机验收时应确认 `ota_0`、`ota_1` 与 `otadata` 均存在且目标槽容量足够。
-
-App 升级步骤：连接 MimiVent App，在菜单打开“固件升级”，选择签名 OTA 包（`.mvota`，或设备明确支持时使用 `.mvdelta`），确认目标版本后上传。数据上传完成不等于升级完成；设备完整校验后由用户再次确认安装，之后等待设备重启，并在重连后核对版本和固件身份。升级/校验/安装期间保持 App 前台、手机靠近设备并保持供电；待安装阶段设备恢复自动控制。
-
-OTA 通过已加密并绑定的 BLE 会话发起，无需按板载 BOOT 键。设备校验整镜像 SHA-256 和发布者签名；签名私钥不得放入仓库或 App。固件允许受控降级，但仍校验镜像身份、分区配置和签名。
-
-本机验证命令：
-
-```sh
-arduino-cli compile --fqbn esp32:esp32:esp32c3 MimiVent
-```
-
-依赖：ESP32 Arduino core、`Adafruit NeoPixel` 1.15.5、`NimBLE-Arduino` 2.5.1。
-
-本项目用 `.clang-format` 固定 Arduino C++ 的格式风格（Google C++ 基础、2 空格缩进、100 列）。格式化时只处理 `.ino/.h/.cpp`，当前每次修改至少执行 Arduino 编译；并用 `git diff --check` 检查空白错误。涉及风机模式或计时逻辑时，再补状态转换测试或实机验证。若系统未安装 `clang-format`，格式化检查需先安装对应工具；仅编译通过不代表格式检查已通过。
-
-无线升级包需要使用仓库外的 RSA 私钥签名。签名生成和密钥管理步骤见 [`docs/ota-signing.md`](docs/ota-signing.md)。
+- 当前版本：`v0.5.0`，配套 App `v0.5.0`；WiFi 开发调试版本统一归入本次更新。上一正式固件为 `v0.4.0`。
+- `FirmwareVersion.h` 是固件版本来源；最低 BLE v2 App 为 `0.3.0`，完整 WiFi 与新统计界面推荐使用本次 App。
+- `v0.4.0` 已提供 BLE v2、签名压缩/差分 OTA、续传、独立安装及 schema 4 统计。本次在其上增加 WiFi，不重复列为新 OTA 功能。
+- 从 `v0.3.1` 旧分区及 BLE v1 首次迁移需 USB 烧录；旧 App 不具备本次 WiFi 配网/绑定能力。
+- 正式发布前同步本文件、`CHANGELOG.md` 和版本头文件，再创建提交及同名 tag；本地提交和 tag 不代表远程 Release 或安装包已上传。
 
 ## 后续扩展
 
-- 连接家中路由器的 STA 模式，让手机留在家庭网络并访问设备；需先配置路由器 SSID/密码。
-- 接入第二个 PIR 时使用 GPIO3，并将触发条件扩展为 PIR A 或 PIR B 任一触发。
-- 需要互联网平台远程控制时，再设计云端接入与身份验证；当前 AP 页面不暴露到互联网。
+- 双猫砂盆、第二个 PIR 与多风道需单独实现和真机验证，当前仍为单 PIR/单风机。
+- WiFi OTA、互联网远程访问与云端身份管理不属于本版交付范围。

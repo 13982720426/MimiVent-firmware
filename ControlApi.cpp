@@ -1,15 +1,22 @@
+#include "WifiHttpsServer.h"
 // 统一维护设备业务规则，传输层只负责解析请求和发送响应。
 #include "ControlApi.h"
 
 #include <cstdio>
 #include <cstdlib>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 
 #include "AppConfig.h"
 #include "FanController.h"
 #include "FirmwareVersion.h"
 #include "StatisticsStore.h"
+#include "AppConfig.h"
+#include "WifiProvisioningManager.h"
 
 namespace {
+
+SemaphoreHandle_t controlMutex = nullptr;
 
 bool lockOffArmed = false;
 unsigned long lockOffArmedMs = 0;
@@ -63,19 +70,32 @@ String formValue(const String& body, const char* key) {
 ControlApiResponse statusResponse(TimingProfile viewProfile) {
   const FanControllerStatus status = fanControllerGetStatus(millis());
   const TimingSettings active = settingsStoreGet(status.activeProfile);
-  char payload[680];
+#if MIMIVENT_ENABLE_WIFI
+#if MIMIVENT_WIFI_READ_CONTROL
+  const char* kCapabilities = wifiHttpsServerReady()
+      ? "[\"ble.control\",\"ble.stats\",\"ble.ota\",\"wifi.configure\",\"wifi.bind\",\"wifi.read\"]"
+      : "[\"ble.control\",\"ble.stats\",\"ble.ota\",\"wifi.configure\"]";
+#else
+  constexpr char kCapabilities[] = "[\"ble.control\",\"ble.stats\",\"ble.ota\",\"wifi.configure\"]";
+#endif
+  constexpr uint8_t kGattVersion = 2;
+#else
+  constexpr char kCapabilities[] = "[\"ble.control\",\"ble.stats\",\"ble.ota\"]";
+  constexpr uint8_t kGattVersion = 1;
+#endif
+  char payload[900];
   snprintf(payload, sizeof(payload),
            "{\"fan\":%s,\"pir\":%s,\"mode\":\"%s\",\"phase\":\"%s\","
            "\"activeProfile\":\"%s\",\"viewProfile\":\"%s\",\"fanRunMs\":%lu,"
            "\"remainingMs\":%lu,\"durationMs\":%lu,\"phaseDurationMs\":%lu,\"startupCooldownMs\":%lu,\"leaveConfirmMs\":%lu,"
-           "\"autoExhaustMs\":%lu,\"manualExhaustMs\":%lu,\"pauseMs\":%lu,\"firmware\":\"%s\",\"minimumAppVersion\":\"%s\",\"statisticsSchema\":%u}",
+           "\"autoExhaustMs\":%lu,\"manualExhaustMs\":%lu,\"pauseMs\":%lu,\"firmware\":\"%s\",\"minimumAppVersion\":\"%s\",\"statisticsSchema\":%u,\"capabilities\":%s,\"gattVersion\":%u}",
            status.fanOn ? "true" : "false", status.presenceDetected ? "true" : "false",
            fanControllerModeName(), fanControllerPhaseName(),
            settingsStoreProfileName(status.activeProfile), settingsStoreProfileName(viewProfile),
            status.fanRunMs, status.remainingMs, status.overrideDurationMs, status.phaseDurationMs,
            active.startupCooldownMs, active.leaveConfirmMs, active.autoExhaustMs,
            active.manualExhaustMs, active.pauseMs, FIRMWARE_VERSION, FIRMWARE_MINIMUM_APP_VERSION,
-           statisticsStoreSchemaVersion());
+           statisticsStoreSchemaVersion(), kCapabilities, kGattVersion);
   return response(200, "application/json; charset=utf-8", payload);
 }
 
@@ -150,7 +170,23 @@ ControlApiResponse lockOffResponse(const ControlApiRequest& request) {
 
 }  // namespace
 
+void controlApiBegin() {
+  if (!controlMutex) controlMutex = xSemaphoreCreateMutex();
+}
+
+void controlApiLock() {
+  if (controlMutex) xSemaphoreTake(controlMutex, portMAX_DELAY);
+}
+
+void controlApiUnlock() {
+  if (controlMutex) xSemaphoreGive(controlMutex);
+}
+
 ControlApiResponse controlApiDispatch(const ControlApiRequest& request) {
+  struct Guard {
+    Guard() { controlApiLock(); }
+    ~Guard() { controlApiUnlock(); }
+  } guard;
   if (request.path == "/api/status" && request.method == "GET") return statusResponse(request.profile);
   if (request.path == "/api/events" && request.method == "GET") {
     unsigned long start = 0;
