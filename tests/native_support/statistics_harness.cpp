@@ -7,6 +7,8 @@ inline time_t testTime(time_t* out) { if(out) *out=fakeNow; return fakeNow; }
 inline int testSetTime(const timeval* value, const void*) { fakeNow=value->tv_sec; return 0; }
 #define time testTime
 #define settimeofday testSetTime
+#include "../../SettingsStore.h"
+TimingSettings settingsStoreGet(TimingProfile) { return {30000, 30000, 120000, 60000, 300000}; }
 #include "../../StatisticsStore.cpp"
 #undef time
 #undef settimeofday
@@ -15,8 +17,16 @@ int main() {
   statisticsStoreBegin();
   assert(statisticsStoreSchemaVersion()==4);
   assert(statisticsStoreSetClock(fakeNow,480));
+  statisticsStoreRecordActivity(120);
+  fakeNow+=30; statisticsStoreRecordActivity(120);
+  fakeNow+=30; statisticsStoreRecordActivity(120);
+  emit("activity_segment",statisticsStoreBuildJson("today",false,0,0));
+  memset(daily,0,sizeof(daily)); memset(events,0,sizeof(events));
+  dailyCount=eventCount=generation=0; ready=false;
+  statisticsStoreBegin();
+  emit("activity_segment_restored",statisticsStoreBuildJson("today",false,0,0));
   statisticsStoreFanStarted(kForce,0);
-  for(int i=0;i<600;i++) statisticsStoreRecordActivity();
+  for(int i=0;i<600;i++) { statisticsStoreRecordActivity(60); fakeNow+=61; }
   assert(eventCount==512);
   assert(activeRun.id!=0); // 明细可淘汰，但运行结算状态不能丢。
   fakeNow+=7200;
@@ -44,7 +54,7 @@ int main() {
   // 无时钟时发生的运行不能被 PIR 洪流挤掉，首次校时仍应归账。
   fakeNow=0; fakeMillis=10000;
   statisticsStoreFanStarted(kForce,fakeMillis);
-  for(int i=0;i<600;i++) statisticsStoreRecordActivity();
+  for(int i=0;i<600;i++) { statisticsStoreRecordActivity(60); fakeMillis+=61000; }
   fakeMillis=70000;
   statisticsStoreFanStopped(60000);
   assert(statisticsStoreSetClock(1793298600,480));

@@ -101,7 +101,11 @@ void updatePresence(unsigned long nowMs) {
 
   previousPresenceDetected = presenceDetected;
   Serial.printf("[%lu ms] PIR: %s\n", nowMs, presenceDetected ? "HIGH" : "LOW");
-  if (presenceDetected) statisticsStoreRecordActivity();
+  if (presenceDetected) {
+    const TimingSettings settings = settingsStoreGet(activeProfile);
+    const uint32_t gapSeconds = settings.autoExhaustMs / 1000UL;
+    statisticsStoreRecordActivity(static_cast<uint16_t>(gapSeconds));
+  }
 
   // 启动冷静期只记录 PIR 当前电平，不推进自动排风状态。
   if (controlMode == ControlMode::AUTO && autoPhase == AutoPhase::STARTUP_COOLDOWN) return;

@@ -11,7 +11,7 @@ bool statisticsStoreHasClock();
 const char* statisticsStoreDeviceId();
 const char* statisticsStoreDataEpoch();
 const char* statisticsStoreBootId();
-void statisticsStoreRecordActivity();
+void statisticsStoreRecordActivity(uint16_t mergeGapSeconds);
 void statisticsStoreRecordTimedPause(unsigned long durationMs);
 void statisticsStoreRecordLockedOff();
 void statisticsStoreRecordAutoResume();

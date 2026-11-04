@@ -1,6 +1,6 @@
 # MimiVent
 
-ESP32-C3-DevKitM-1 单猫砂盆自动排风固件，通过 MimiVent App 的 BLE 或 WiFi 控制设备。当前基础方案使用 **1 个猫砂盆、1 个 PIR、1 台风机**；设备开机后先执行启动冷静期，再进入 PIR 自动感应。手机页面可查看 PIR/风机状态，临时强制开/关均可设定时长，另有需要二次确认的持续关闭锁。三通、第二段支管和第二个 PIR 是连接第二个猫砂盆时才需要的可选扩展，不属于当前基础方案的必需配件。当前固件版本为 `v0.5.0`，配套 App `v0.5.0`；上一正式固件为 `v0.4.0`。WiFi 配网与 HTTPS 控制已完成用户真机验证。变化见 [CHANGELOG.md](CHANGELOG.md)。
+ESP32-C3-DevKitM-1 单猫砂盆自动排风固件，通过 MimiVent App 的 BLE 或 WiFi 控制设备。当前基础方案使用 **1 个猫砂盆、1 个 PIR、1 台风机**；设备开机后先执行启动冷静期，再进入 PIR 自动感应。手机页面可查看 PIR/风机状态，临时强制开/关均可设定时长，另有需要二次确认的持续关闭锁。三通、第二段支管和第二个 PIR 是连接第二个猫砂盆时才需要的可选扩展，不属于当前基础方案的必需配件。当前固件版本为 `v0.5.1`，配套 App `v0.5.1`；上一正式固件为 `v0.4.0`。WiFi 配网与 HTTPS 控制已完成用户真机验证。变化见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 项目启动前准备
 
@@ -34,7 +34,7 @@ ESP32-C3-DevKitM-1 单猫砂盆自动排风固件，通过 MimiVent App 的 BLE 
 - macOS、Windows 或 Linux 均可开发；Arduino IDE 2.x 可用于编辑、编译和烧录。本项目不要求 Windows。
 - 需要安装的软件：Arduino IDE 2.x、Espressif Systems 的 `esp32` 板卡包、`Adafruit NeoPixel` 库、`NimBLE-Arduino` 库。
 - `WiFi`、ESP-IDF HTTPS/TLS 和 `Preferences`（NVS 配置存储）库由 ESP32 Arduino core 自带，不要在 Library Manager 里另外安装同名库。
-- 当前构建组合：Arduino IDE 2.3.10、ESP32 Arduino core `esp32:esp32` 3.3.12、Adafruit NeoPixel 1.15.5、NimBLE-Arduino 2.5.1。v0.4.0 已通过 Arduino CLI 编译及 USB 烧录校验，并完成 BLE OTA 完整包/差分包、暂停续传、安装重连核验和任务放弃/替换真机验证；v0.5.0 为 WiFi 功能版本，需与 App v0.5.0 配套。应用槽上限为 1,769,472 字节。
+- 当前构建组合：Arduino IDE 2.3.10、ESP32 Arduino core `esp32:esp32` 3.3.12、Adafruit NeoPixel 1.15.5、NimBLE-Arduino 2.5.1。v0.4.0 已通过 Arduino CLI 编译及 USB 烧录校验，并完成 BLE OTA 完整包/差分包、暂停续传、安装重连核验和任务放弃/替换真机验证；v0.5.0 为 WiFi 功能版本；v0.5.1 将 WiFi 绑定上限提升到 3 个，需与 App v0.5.1 配套。应用槽上限为 1,769,472 字节。
 - 将本仓库整个项目目录放在 Arduino sketchbook 下，保持目录名和主 `.ino` 文件名一致：`MimiVent/MimiVent.ino`。
 - 首次接线烧录时使用 USB 数据线连接开发板；在 IDE 中选择对应串口和 `ESP32C3 Dev Module` 板卡配置。
 
@@ -196,7 +196,7 @@ App 菜单“固件升级”选择签名 `.mvota` 完整包，或基线镜像匹
 - 采用 schema 4、512 条事件上限和 SPIFFS 双槽快照；每日汇总保留 30 天，明细最多 10 天，亦受事件容量限制。事件淘汰后运行汇总仍可能存在，不能据此判定数据丢失或统计矛盾。
 - 运行汇总按小时累计，包含自动、临时、强制排风和当前运行；风机运行期间不每秒写 Flash，结束时保存最终时长。重启未完成运行标记为中断。
 - 未校时事件可在本次开机首次校时后回填；在校时前再次断电，无法还原可靠自然日。已初始化分区挂载失败时禁用统计并保留现场，不自动格式化历史数据。
-- `GET /api/stats?mode=today|yesterday|threeDays|sevenDays` 返回汇总和图表；`GET /api/events` 支持时间范围、类型筛选和事件 ID 游标分页。App 负责活动分组与展示。
+- `GET /api/stats?mode=today|yesterday|threeDays|sevenDays` 返回汇总和图表；`GET /api/events` 支持时间范围、类型筛选和事件 ID 游标分页。`toiletAverageSeconds` 和 `toiletSampleCount` 由全部有效自动排风样本汇总，App 不依赖最近 32 条事件计算平均值。App 负责活动分组与展示。
 - `toiletCount` 按当前保留的自动排风记录估算：实际运行达到该次设定时长一半时计入，手动及强制排风不计入；新记录保存启动时设定，旧记录缺失时使用当前正式配置。它不是独立永久日计数，也不是实际人数测量，明细淘汰会影响可追溯范围。
 - 统计数据集由 `deviceId`、`dataEpoch`、`bootId` 标识。schema 4 的正常同格式升级不主动清空数据；更早不兼容格式的迁移行为应单独核对，不承诺任意历史格式无损升级。
 
@@ -229,7 +229,7 @@ App 菜单“固件升级”选择签名 `.mvota` 完整包，或基线镜像匹
 - 配网要求 BLE 已加密并 bonding。无屏设备采用系统配对，不执行 MITM 身份认证或自定义六位码验证；在可信设备附近操作。
 - 支持 2.4 GHz WPA2-Personal 与 WPA2/WPA3-Personal 混合网络；凭据保存在 NVS，开机恢复连接。App 不保存 WiFi 密码，日志不记录密码或完整配网正文。
 - HTTPS `8443` 提供状态、设置、控制、统计、事件与请求结果查询，使用设备证书固定和 Bearer token；不启动 SoftAP、明文 HTTP 或内嵌网页。
-- 绑定经安全 BLE 管理，设备最多保存两个有效客户端；支持待绑定、核验、幂等提交、撤销和清除全部绑定。清除绑定同时释放 WiFi 租约，不等于清除 WiFi 密码或全部设备数据。
+- 绑定经安全 BLE 管理，设备最多保存三个有效客户端；支持待绑定、核验、幂等提交、撤销和清除全部绑定。清除绑定同时释放 WiFi 租约，不等于清除 WiFi 密码或全部设备数据。
 - 同时只有一份 WiFi 控制租约，空闲 20 秒过期，另一手机需等待释放/过期；BLE 控制与 WiFi 控制通过共享业务层协调。两份绑定不代表两路并行 WiFi 主控。
 - HTTPS 单连接、请求有界排队；写请求使用请求 ID 去重和结果查询，超时后先确认执行结果。
 - 校时仍经 BLE `/api/time` 完成，HTTPS 不提供该路由；断电重启后无可信时钟时，日期统计需等待校时。
@@ -266,7 +266,7 @@ PIR 模块自身输出 HIGH 的保持时间由模块电位器控制；软件离�
 
 ## 版本与兼容性
 
-- 当前版本：`v0.5.0`，配套 App `v0.5.0`；WiFi 开发调试版本统一归入本次更新。上一正式固件为 `v0.4.0`。
+- 当前版本：`v0.5.1`，配套 App `v0.5.1`；WiFi 开发调试版本统一归入本次更新。上一正式固件为 `v0.4.0`。
 - `FirmwareVersion.h` 是固件版本来源；最低 BLE v2 App 为 `0.3.0`，完整 WiFi 与新统计界面推荐使用本次 App。
 - `v0.4.0` 已提供 BLE v2、签名压缩/差分 OTA、续传、独立安装及 schema 4 统计。本次在其上增加 WiFi，不重复列为新 OTA 功能。
 - 从 `v0.3.1` 旧分区及 BLE v1 首次迁移需 USB 烧录；旧 App 不具备本次 WiFi 配网/绑定能力。

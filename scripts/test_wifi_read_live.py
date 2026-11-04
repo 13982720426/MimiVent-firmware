@@ -69,13 +69,14 @@ async def run(args):
   else:raise RuntimeError('WIFI_READ_UNAVAILABLE')
   clients=await call('wifi.clients')
   if clients.get('clients'):raise RuntimeError('PRESERVE_EXISTING_CLIENTS')
-  suffix=uuid.uuid4().hex[:12];clientA='probe-a-'+suffix;clientB='probe-b-'+suffix
+  suffix=uuid.uuid4().hex[:12];clientA='probe-a-'+suffix;clientB='probe-b-'+suffix;clientC='probe-c-'+suffix
   a=await begin(clientA);await commit(a);record('client-a-active')
   b=await begin(clientB);await commit(b);record('client-b-active')
+  c=await begin(clientC);await commit(c);record('client-c-active')
   await call('wifi.bind.open')
-  full=await session.secure('wifi.bind.begin',clientId='probe-third-'+suffix,requestId=str(uuid.uuid4()))
+  full=await session.secure('wifi.bind.begin',clientId='probe-fourth-'+suffix,requestId=str(uuid.uuid4()))
   if full.get('error')!='BINDINGS_FULL':raise RuntimeError('CAPACITY_LIMIT_FAILED')
-  record('third-client-rejected')
+  record('fourth-client-rejected')
   candidate=await begin(clientA,True)
   await probe(a) # 候选提交前旧 token 仍有效。
   await commit(candidate);await probe(a,'error:BINDING_INVALID');a=candidate

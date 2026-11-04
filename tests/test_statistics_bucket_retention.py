@@ -23,11 +23,17 @@ class StatisticsBucketRetentionTest(unittest.TestCase):
             self.assertEqual(run.returncode, 0, run.stderr)
             rows = dict((name, json.loads(payload)) for name,payload in
                         (line.split('\t',1) for line in run.stdout.splitlines()))
-            for name,expected in [('today',5400),('yesterday',1800),('threeDays',7200),('sevenDays',7200),('restored',7200),('active_today',5400),('unsynced',60)]:
+            for name,expected in [('today',5460),('yesterday',1740),('threeDays',7200),('sevenDays',7200),('restored',7200),('active_today',5460),('unsynced',60)]:
                 self.assertEqual(rows[name]['runtimeSeconds'], expected, name)
                 self.assertEqual(sum(rows[name]['bucketSeconds']), expected, name)
-            self.assertEqual(rows['today']['bucketSeconds'][:2], [3600,1800])
-            self.assertEqual(rows['yesterday']['bucketSeconds'][-1],1800)
+            self.assertEqual(rows['today']['bucketSeconds'][:2], [3600,1860])
+            self.assertEqual(rows['yesterday']['bucketSeconds'][-1],1740)
+            segment = rows['activity_segment']
+            self.assertEqual(len(segment['events']),1)
+            self.assertEqual(segment['activityBucketSeconds'][23],60)
+            self.assertEqual(segment['events'][0]['triggerCount'],3)
+            self.assertEqual(segment['events'][0]['durationSeconds'],60)
+            self.assertEqual(sum(rows['activity_segment_restored']['activityBucketSeconds']),60)
             self.assertEqual(sum(day['runtimeSeconds'] for day in rows['active_threeDays']['days']),7200)
             self.assertTrue(rows['events']['eventsTruncated'])
             self.assertEqual(rows['reset']['runtimeSeconds'],0)

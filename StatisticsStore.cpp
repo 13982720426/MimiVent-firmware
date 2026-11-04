@@ -9,6 +9,7 @@
 
 #include "StatisticsConfig.h"
 #include "StatisticsTypes.h"
+#include "StatisticsActivityCore.h"
 #include "FirmwareVersion.h"
 #include "SettingsStore.h"
 
@@ -92,6 +93,9 @@ size_t activeEventIndex = kEventCapacity;
 EventRecord activeRun{};
 uint32_t droppedThroughEpoch = 0;
 bool filesystemPreviouslyInitialized = false;
+// 同一连续活动段只占一个事件槽；阈值在首个触发时锁定，重启后不继续合并。
+uint32_t activeActivityId = 0;
+uint16_t activeActivityGapSeconds = 0;
 
 void updateDataEpoch(const uint8_t* epoch) {
   for (size_t i = 0; i < 16; ++i) {
@@ -280,6 +284,45 @@ void addRuntimeToBuckets(uint32_t startEpoch, uint64_t durationSeconds,
   }
 }
 
+void addActivityToBuckets(uint32_t periodStart, uint32_t periodEnd,
+                         uint8_t bucketSpanHours, uint8_t bucketCount,
+                         uint64_t* buckets, uint32_t* activityCounts) {
+  const int32_t offsetSeconds = static_cast<int32_t>(timezoneOffsetMinutes) * 60;
+  const int64_t localPeriodDay =
+      (static_cast<int64_t>(periodStart) + offsetSeconds) / kSecondsPerDay;
+  const uint32_t bucketsPerDay = 24 / bucketSpanHours;
+  for (size_t i = 0; i < eventCount;) {
+    const EventRecord& first = events[i];
+    if (first.kind != kActivity || !first.unixSeconds ||
+        isUnsyncedTime(first.unixSeconds)) {
+      ++i;
+      continue;
+    }
+
+    // 只有带压缩标记的新版活动段用于连续感应时长；旧记录缺少历史阈值，不回算新指标。
+    if (first.reserved > 1 || first.durationSeconds > 0) {
+      addRuntimeToBuckets(first.unixSeconds, first.durationSeconds, periodStart,
+                          periodEnd, bucketSpanHours, bucketCount, buckets);
+    }
+    // 单次触发的真实跨度为 0 秒，单独计入事件桶，让图表仍能标出触发时段。
+    if (activityCounts && first.unixSeconds >= periodStart &&
+        first.unixSeconds < periodEnd) {
+      const int64_t localEpoch =
+          static_cast<int64_t>(first.unixSeconds) + offsetSeconds;
+      const int64_t dayIndex = localEpoch / kSecondsPerDay - localPeriodDay;
+      const uint8_t hour = static_cast<uint8_t>(
+          (localEpoch % kSecondsPerDay) / 3600);
+      const int64_t bucketIndex =
+          dayIndex * bucketsPerDay + hour / bucketSpanHours;
+      if (bucketIndex >= 0 && bucketIndex < bucketCount &&
+          activityCounts[bucketIndex] < UINT32_MAX) {
+        ++activityCounts[bucketIndex];
+      }
+    }
+    ++i;
+  }
+}
+
 size_t findDaily(uint32_t dayKey) {
   for (size_t i = 0; i < dailyCount; ++i) {
     if (daily[i].dayKey == dayKey) return i;
@@ -397,11 +440,34 @@ void prune() {
 void findActiveEvent() {
   activeEventIndex = kEventCapacity;
   for (size_t i = eventCount; i > 0; --i) {
-    if (events[i - 1].state == kActive) {
+    if (isFanRuntimeKind(events[i - 1].kind) && events[i - 1].state == kActive) {
       activeEventIndex = i - 1;
       return;
     }
   }
+}
+
+bool prepareEventSlot(uint8_t kind) {
+  if (eventCount < kEventCapacity) return true;
+  size_t eviction = 0;
+  // 待校时运行区间优先保留，避免活动段挤掉尚未归入小时桶的风机时长。
+  while (eviction < eventCount && isFanRuntimeKind(events[eviction].kind) &&
+         isUnsyncedTime(events[eviction].unixSeconds)) ++eviction;
+  if (eviction == eventCount) {
+    if (kind == kActivity) return false;
+    eviction = 0;
+  }
+  if (!isUnsyncedTime(events[eviction].unixSeconds)) {
+    droppedThroughEpoch = max(droppedThroughEpoch, events[eviction].unixSeconds);
+  }
+  if (events[eviction].id == activeActivityId) {
+    activeActivityId = 0;
+    activeActivityGapSeconds = 0;
+  }
+  memmove(events + eviction, events + eviction + 1,
+          (eventCount - eviction - 1) * sizeof(EventRecord));
+  --eventCount;
+  return true;
 }
 
 void addEvent(uint8_t kind, uint8_t state, uint32_t durationSeconds = 0) {
@@ -410,22 +476,10 @@ void addEvent(uint8_t kind, uint8_t state, uint32_t durationSeconds = 0) {
     Serial.println("Statistics: event ID exhausted; refusing to reuse IDs");
     return;
   }
-  size_t eviction = 0;
-  if (eventCount == kEventCapacity) {
-    // 待校时运行区间优先保留，避免 PIR 明细挤掉尚未归入小时桶的时长。
-    while (eviction < eventCount && isFanRuntimeKind(events[eviction].kind) &&
-           isUnsyncedTime(events[eviction].unixSeconds)) ++eviction;
-    if (eviction == eventCount) {
-      // 全部为待校时运行记录时，不再用活动明细替换它们。
-      if (kind == kActivity) return;
-      eviction = 0;
-    }
-    if (!isUnsyncedTime(events[eviction].unixSeconds)) {
-      droppedThroughEpoch = max(droppedThroughEpoch, events[eviction].unixSeconds);
-    }
-    memmove(events + eviction, events + eviction + 1,
-            (eventCount - eviction - 1) * sizeof(EventRecord));
-    --eventCount;
+  if (!prepareEventSlot(kind)) return;
+  if (kind != kActivity) {
+    activeActivityId = 0;
+    activeActivityGapSeconds = 0;
   }
   const uint32_t timestamp = eventTimestamp();
   const uint32_t eventId = nextEventId;
@@ -463,6 +517,10 @@ const char* stateName(uint8_t state) {
 }
 
 bool eventInRange(const EventRecord& event, uint32_t start, uint32_t end) {
+  if (event.kind == kActivity && event.durationSeconds) {
+    const uint64_t eventEnd = static_cast<uint64_t>(event.unixSeconds) + event.durationSeconds;
+    return event.unixSeconds < end && eventEnd > start;
+  }
   return event.unixSeconds >= start && event.unixSeconds < end;
 }
 
@@ -503,6 +561,8 @@ void initializeDatasetIdentity() {
 uint16_t statisticsStoreSchemaVersion() { return kSchema; }
 
 void statisticsStoreBegin() {
+  activeActivityId = 0;
+  activeActivityGapSeconds = 0;
   initializeDatasetIdentity();
   if (!mountStatisticsFilesystem()) {
     Serial.println("Statistics: SPIFFS unavailable; statistics disabled");
@@ -608,8 +668,10 @@ bool statisticsStoreSetClock(uint32_t unixSeconds, int16_t utcOffsetMinutes) {
     event.unixSeconds = unixSeconds - elapsed;
     DailyRecord* day = ensureDaily(dayKeyForEpoch(event.unixSeconds));
     if (!day) continue;
-    if (event.kind == kActivity && day->activityCount < 0xFFFF) {
-      ++day->activityCount;
+    if (event.kind == kActivity) {
+      const uint32_t amount = event.reserved ? event.reserved : 1;
+      const uint32_t total = static_cast<uint32_t>(day->activityCount) + amount;
+      day->activityCount = total > 0xFFFF ? 0xFFFF : static_cast<uint16_t>(total);
     } else if (event.kind == kAutomatic && day->automaticCount < 0xFFFF) {
       ++day->automaticCount;
     }
@@ -636,9 +698,53 @@ const char* statisticsStoreDeviceId() { return deviceIdHex; }
 const char* statisticsStoreDataEpoch() { return dataEpochHex; }
 const char* statisticsStoreBootId() { return bootIdHex; }
 
-void statisticsStoreRecordActivity() {
-  if (!ready) return;
-  addEvent(kActivity, kComplete);
+void statisticsStoreRecordActivity(uint16_t mergeGapSeconds) {
+  if (!ready || mergeGapSeconds == 0) return;
+  // 未校时时保留逐条 uptime 记录，校时后才能准确按日期回填，不能把跨午夜触发合并到首日。
+  if (!currentEpoch()) {
+    activeActivityId = 0;
+    activeActivityGapSeconds = 0;
+    addEvent(kActivity, kComplete);
+    return;
+  }
+  const uint32_t timestamp = eventTimestamp();
+  if (activeActivityId && eventCount && events[eventCount - 1].id == activeActivityId) {
+    EventRecord& previous = events[eventCount - 1];
+    const uint64_t lastTimestamp = static_cast<uint64_t>(previous.unixSeconds) +
+                                   previous.durationSeconds;
+    if (lastTimestamp <= UINT32_MAX && previous.reserved < UINT16_MAX) {
+      StatisticsActivitySegment segment{
+          previous.unixSeconds, static_cast<uint32_t>(lastTimestamp),
+          static_cast<uint32_t>(previous.reserved ? previous.reserved : 1),
+          activeActivityGapSeconds, true};
+      StatisticsActivitySegment completed{};
+      const auto result = statisticsActivityAdd(&segment, timestamp,
+                                                mergeGapSeconds, &completed);
+      if (result == StatisticsActivityResult::kExtended) {
+        previous.durationSeconds = segment.last - segment.first;
+        previous.reserved = static_cast<uint16_t>(segment.count);
+        DailyRecord* day = ensureDaily(currentDayKey());
+        if (day && day->activityCount < UINT16_MAX) ++day->activityCount;
+        prune();
+        persist();
+        return;
+      }
+    }
+  }
+
+  activeActivityId = 0;
+  activeActivityGapSeconds = 0;
+  if (nextEventId == 0) return;
+  if (!prepareEventSlot(kActivity)) return;
+  const uint32_t eventId = nextEventId;
+  nextEventId = eventId == UINT32_MAX ? 0 : eventId + 1;
+  events[eventCount++] = {eventId, timestamp, 0, kActivity, kComplete, 1};
+  activeActivityId = eventId;
+  activeActivityGapSeconds = mergeGapSeconds;
+  DailyRecord* day = ensureDaily(currentDayKey());
+  if (day && day->activityCount < UINT16_MAX) ++day->activityCount;
+  prune();
+  persist();
 }
 
 void statisticsStoreRecordTimedPause(unsigned long durationMs) {
@@ -685,8 +791,12 @@ void statisticsStoreFanStopped(unsigned long durationMs) {
   persist();
 }
 
-uint16_t countValidToilets(uint32_t start, uint32_t end, unsigned long activeRunMs) {
+uint16_t countValidToilets(uint32_t start, uint32_t end, unsigned long activeRunMs,
+                           uint64_t* durationSeconds = nullptr,
+                           uint16_t* sampleCount = nullptr) {
   uint16_t count = 0;
+  uint64_t totalDuration = 0;
+  uint16_t samples = 0;
   for (size_t i = 0; i < eventCount; ++i) {
     const EventRecord& event = events[i];
     if (event.kind != kAutomatic || !eventInRange(event, start, end)) continue;
@@ -699,8 +809,14 @@ uint16_t countValidToilets(uint32_t start, uint32_t end, unsigned long activeRun
             static_cast<size_t>(i) == activeEventIndex
         ? activeRunMs / 1000UL
         : event.durationSeconds;
-    if (effective * 2 >= configured) ++count;
+    if (effective * 2 >= configured) {
+      ++count;
+      totalDuration += effective;
+      ++samples;
+    }
   }
+  if (durationSeconds) *durationSeconds = totalDuration;
+  if (sampleCount) *sampleCount = samples;
   return count;
 }
 
@@ -724,6 +840,8 @@ String statisticsStoreBuildJson(const String& range, bool fanOn, unsigned long a
   uint32_t activityCount = 0;
   uint32_t automaticCount = 0;
   uint64_t buckets[24]{};
+  uint64_t activityBuckets[24]{};
+  uint32_t activityCounts[24]{};
   String eventsJson = "[";
   uint16_t eventTotal = 0;
   uint8_t recentCount = 0;
@@ -755,11 +873,17 @@ String statisticsStoreBuildJson(const String& range, bool fanOn, unsigned long a
                           bucketCount, buckets);
     }
   }
+  if (now) addActivityToBuckets(periodStart, periodEnd, bucketSpanHours,
+                                bucketCount, activityBuckets, activityCounts);
   for (uint8_t bucket = 0; bucket < bucketCount; ++bucket) runtimeSeconds += buckets[bucket];
   uint32_t eventStart = 0;
   uint32_t eventEnd = 0;
   uint32_t nextCursor = 0;
-  uint16_t toiletCount = countValidToilets(periodStart, periodEnd, activeRunMs);
+  uint64_t toiletDurationSeconds = 0;
+  uint16_t toiletSampleCount = 0;
+  uint16_t toiletCount = countValidToilets(periodStart, periodEnd, activeRunMs,
+                                           &toiletDurationSeconds,
+                                           &toiletSampleCount);
   if (range == "today" || range == "yesterday") {
     // 今日和昨日都使用本地自然日边界；今日窗口从本地零点到本次响应时间。
     eventStart = range == "today" ? todayStart : periodStart;
@@ -773,7 +897,11 @@ String statisticsStoreBuildJson(const String& range, bool fanOn, unsigned long a
         if (recentCount++) eventsJson += ',';
         eventsJson += "{\"id\":" + String(event.id) +
                       ",\"time\":" + String(event.unixSeconds) + ",\"kind\":\"" + kindName(event.kind) +
-                      "\",\"state\":\"" + stateName(event.state) + "\",\"durationSeconds\":" + String(event.durationSeconds) + "}";
+                      "\",\"state\":\"" + stateName(event.state) + "\",\"durationSeconds\":" + String(event.durationSeconds);
+        if (event.kind == kActivity) {
+          eventsJson += ",\"triggerCount\":" + String(event.reserved ? event.reserved : 1);
+        }
+        eventsJson += "}";
         nextCursor = event.id;
       }
       if (eventTotal < 0xFFFF) ++eventTotal;
@@ -787,8 +915,22 @@ String statisticsStoreBuildJson(const String& range, bool fanOn, unsigned long a
       ",\"active\":" + String(fanOn ? "true" : "false") +
       ",\"range\":\"" + range + "\",\"runtimeSeconds\":" + String(runtimeSeconds) +
       ",\"activityCount\":" + String(activityCount) + ",\"automaticCount\":" + String(automaticCount) +
-      ",\"toiletCount\":" + String(toiletCount) + ",\"bucketSeconds\":[";
+      ",\"toiletCount\":" + String(toiletCount) +
+      ",\"toiletAverageSeconds\":" +
+      String(toiletSampleCount ? static_cast<uint32_t>(toiletDurationSeconds / toiletSampleCount) : 0) +
+      ",\"toiletSampleCount\":" + String(toiletSampleCount) +
+      ",\"bucketSeconds\":[";
   for (uint8_t i = 0; i < bucketCount; ++i) { if (i) json += ','; json += String(buckets[i]); }
+  json += "],\"activityBucketSeconds\":[";
+  for (uint8_t i = 0; i < bucketCount; ++i) {
+    if (i) json += ',';
+    json += String(activityBuckets[i]);
+  }
+  json += "],\"activityBucketCount\":[";
+  for (uint8_t i = 0; i < bucketCount; ++i) {
+    if (i) json += ',';
+    json += String(activityCounts[i]);
+  }
   json += "],\"events\":" + eventsJson;
   const bool eventsHasMore = static_cast<uint32_t>(eventOffset) + recentCount < eventTotal;
   json += ",\"statisticsSchema\":" + String(kSchema);
@@ -850,7 +992,11 @@ String statisticsStoreBuildEventsJson(uint32_t start, uint32_t end, const String
                     ",\"time\":" + String(event.unixSeconds) +
                     ",\"kind\":\"" + eventKind +
                     "\",\"state\":\"" + stateName(event.state) +
-                    "\",\"durationSeconds\":" + String(event.durationSeconds) + "}";
+                    "\",\"durationSeconds\":" + String(event.durationSeconds);
+      if (event.kind == kActivity) {
+        eventsJson += ",\"triggerCount\":" + String(event.reserved ? event.reserved : 1);
+      }
+      eventsJson += "}";
       nextCursor = event.id;
     }
   }

@@ -60,7 +60,14 @@ bool save(const Record& r,void*) {
 bool load(const char* key,Record& r,bool& exists) {
  size_t n=0;const auto rc=nvs_get_blob(storage,key,nullptr,&n);exists=rc!=ESP_ERR_NVS_NOT_FOUND;
  if(!exists)return true;
- return rc==ESP_OK&&n==sizeof(r)&&nvs_get_blob(storage,key,&r,&n)==ESP_OK;
+ if(rc!=ESP_OK)return false;
+ if(n==sizeof(r))return nvs_get_blob(storage,key,&r,&n)==ESP_OK;
+ if(n==sizeof(RecordV1)){
+  RecordV1 old{};size_t oldLength=sizeof(old);
+  if(nvs_get_blob(storage,key,&old,&oldLength)!=ESP_OK||oldLength!=sizeof(old)||!validV1(old))return false;
+  r=migrateV1(old);return true;
+ }
+ return false;
 }
 void randomHex(char* output,size_t bytes) {uint8_t raw[16];esp_fill_random(raw,bytes);for(size_t i=0;i<bytes;++i)snprintf(output+i*2,3,"%02x",raw[i]);}
 void randomToken(char token[44]) {
@@ -96,7 +103,7 @@ void wifiBindingBegin() {
  if(nvs_open("mv-bindings",NVS_READWRITE,&storage)!=ESP_OK){storeState="STORAGE_UNAVAILABLE";return;}
  storageOpen=true;Record a{},b{};bool ae=false,be=false;
  if(!load("slot-a",a,ae)||!load("slot-b",b,be)){storeState="RECORD_UNREADABLE";return;}
- if((ae&&a.version!=1)||(be&&b.version!=1)){storeState="MIGRATION_REQUIRED";return;}
+ if((ae&&a.version!=kRecordVersion)||(be&&b.version!=kRecordVersion)){storeState="MIGRATION_REQUIRED";return;}
  const bool av=ae&&valid(a),bv=be&&valid(b);
  if((ae||be)&&!av&&!bv){storeState="BINDINGS_CORRUPT";return;}
  if(av&&bv&&a.sequence==b.sequence&&memcmp(&a,&b,sizeof(a))){storeState="BINDINGS_CORRUPT";return;}
