@@ -52,6 +52,10 @@ def build(base: bytes, target: bytes, private_key: Path) -> bytes:
     if len(base_version) > 15 or len(target_version) > 15 or len(target_profile) > 32:
         raise ValueError("firmware metadata exceeds the delta header limits")
     statistics_schema = int(marker(target, "MIMIVENT_STATISTICS_SCHEMA"))
+    readable_marker = re.search(rb"MIMIVENT_MIN_READABLE_STORAGE_SCHEMA=(\d+)", target)
+    min_readable = int(readable_marker.group(1)) if readable_marker else statistics_schema
+    if not 1 <= min_readable <= statistics_schema:
+        raise ValueError("invalid readable storage schema range")
     if not 0 <= statistics_schema <= 0xFFFF:
         raise ValueError("statistics schema is outside uint16 range")
 
@@ -93,6 +97,7 @@ def build(base: bytes, target: bytes, private_key: Path) -> bytes:
     struct.pack_into("<H", header, 153, statistics_schema)
     struct.pack_into("<I", header, 156, BLOCK_SIZE)
     struct.pack_into("<H", header, 160, RECORD_SIZE)
+    struct.pack_into("<H", header, 162, min_readable)
     struct.pack_into("<I", header, 188, crc32(header[:188]))
     header[LEGACY_HEADER_SIZE:] = sign_image(target, private_key)
     return bytes(header + records)

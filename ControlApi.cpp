@@ -83,19 +83,26 @@ ControlApiResponse statusResponse(TimingProfile viewProfile) {
   constexpr char kCapabilities[] = "[\"ble.control\",\"ble.stats\",\"ble.ota\"]";
   constexpr uint8_t kGattVersion = 1;
 #endif
-  char payload[900];
+  // 新增 storageSchema / minReadableStorageSchema 后需重新核算长度，避免被 snprintf 截断。
+  char payload[1024];
   snprintf(payload, sizeof(payload),
            "{\"fan\":%s,\"pir\":%s,\"mode\":\"%s\",\"phase\":\"%s\","
            "\"activeProfile\":\"%s\",\"viewProfile\":\"%s\",\"fanRunMs\":%lu,"
            "\"remainingMs\":%lu,\"durationMs\":%lu,\"phaseDurationMs\":%lu,\"startupCooldownMs\":%lu,\"leaveConfirmMs\":%lu,"
-           "\"autoExhaustMs\":%lu,\"manualExhaustMs\":%lu,\"pauseMs\":%lu,\"firmware\":\"%s\",\"minimumAppVersion\":\"%s\",\"statisticsSchema\":%u,\"capabilities\":%s,\"gattVersion\":%u}",
+           "\"autoExhaustMs\":%lu,\"manualExhaustMs\":%lu,\"pauseMs\":%lu,\"firmware\":\"%s\",\"minimumAppVersion\":\"%s\",\"statisticsSchema\":%u,"
+           "\"storageSchema\":%u,\"minReadableStorageSchema\":%u,\"statsRangeApiVersion\":2,"
+           "\"tzOffsetSeconds\":%ld,"
+           "\"capabilities\":%s,\"gattVersion\":%u}",
            status.fanOn ? "true" : "false", status.presenceDetected ? "true" : "false",
            fanControllerModeName(), fanControllerPhaseName(),
            settingsStoreProfileName(status.activeProfile), settingsStoreProfileName(viewProfile),
            status.fanRunMs, status.remainingMs, status.overrideDurationMs, status.phaseDurationMs,
            active.startupCooldownMs, active.leaveConfirmMs, active.autoExhaustMs,
            active.manualExhaustMs, active.pauseMs, FIRMWARE_VERSION, FIRMWARE_MINIMUM_APP_VERSION,
-           statisticsStoreSchemaVersion(), kCapabilities, kGattVersion);
+           statisticsSchemaCompatVersion(), statisticsStoreSchemaVersion(),
+           statisticsStoreMinReadableSchemaVersion(),
+           static_cast<long>(statisticsStoreTimezoneOffsetSeconds()),
+           kCapabilities, kGattVersion);
   return response(200, "application/json; charset=utf-8", payload);
 }
 
@@ -227,6 +234,39 @@ ControlApiResponse controlApiDispatch(const ControlApiRequest& request) {
                         static_cast<uint32_t>(start), static_cast<uint32_t>(end), kind,
                         static_cast<uint16_t>(offset), static_cast<uint8_t>(limit),
                         status.fanRunMs, static_cast<uint32_t>(beforeId)));
+  }
+  if (request.path == "/api/stats/range" && request.method == "GET") {
+    unsigned long rangeFrom = 0;
+    unsigned long rangeTo = 0;
+    if (!parseUnsignedParameter(request.rangeFrom, &rangeFrom) ||
+        !parseUnsignedParameter(request.rangeTo, &rangeTo) || rangeFrom >= rangeTo) {
+      return jsonError(400, "INVALID_RANGE");
+    }
+    long offsetSeconds = 0;
+    {
+      const char* text = request.rangeTz.c_str();
+      char* end = nullptr;
+      offsetSeconds = strtol(text, &end, 10);
+      if (!request.rangeTz.length() || end == text || *end != '\0' ||
+          offsetSeconds < -43200L || offsetSeconds > 50400L) {
+        return jsonError(400, "INVALID_RANGE");
+      }
+    }
+    uint8_t rangeError = 0;
+    const String body = statisticsStoreBuildRangeJson(
+        static_cast<uint32_t>(rangeFrom), static_cast<uint32_t>(rangeTo),
+        static_cast<int32_t>(offsetSeconds), &rangeError);
+    switch (static_cast<StatisticsRangeError>(rangeError)) {
+      case StatisticsRangeError::kInvalidRange: return jsonError(400, "INVALID_RANGE");
+      case StatisticsRangeError::kRangeTooLarge: return jsonError(400, "RANGE_TOO_LARGE");
+      case StatisticsRangeError::kRangeOutOfRetention:
+        return jsonError(400, "RANGE_OUT_OF_RETENTION");
+      case StatisticsRangeError::kTimezoneMismatch:
+        return jsonError(409, "TIMEZONE_MISMATCH");
+      case StatisticsRangeError::kNotReady: return jsonError(503, "STATS_NOT_READY");
+      case StatisticsRangeError::kNone: break;
+    }
+    return response(200, "application/json; charset=utf-8", body);
   }
   if (request.path == "/api/stats" && request.method == "GET") {
     const FanControllerStatus status = fanControllerGetStatus(millis());

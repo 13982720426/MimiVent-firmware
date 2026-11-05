@@ -28,15 +28,18 @@ int main(){
  c.pending.verified=true; assert(!c.commit("owner-b",b.id,120004,save,nullptr));
  c.tick(240003); assert(!c.open("owner-a",240004));
  auto third=entry("third","owner-c","33333333333333333333333333333333",3);
- assert(!c.open("owner-c",240006));assert(!c.begin(third,"c","t",false,240007));
- c.pending.verified=true;assert(!c.commit("owner-c",third.id,240008,save,nullptr));
+ assert(c.open("owner-c",240006)); // owner-a 的窗口尚未过期，应拒绝其他 owner。
+ c.tick(360005);
+ assert(!c.open("owner-c",360006));assert(!c.begin(third,"c","t",false,360007));
+ c.pending.verified=true;assert(!c.commit("owner-c",third.id,360008,save,nullptr));
  auto fourth=entry("fourth","owner-a","44444444444444444444444444444444",4);
- assert(!c.open("owner-a",240009));assert(!strcmp(c.begin(fourth,"d","t",false,240010),"BINDINGS_FULL"));
+ c.tick(480007);
+ assert(!c.open("owner-a",480009));assert(!strcmp(c.begin(fourth,"d","t",false,480010),"BINDINGS_FULL"));
  auto replacement=entry("phone-a","owner-a","55555555555555555555555555555555",5);
- assert(c.begin(replacement,"r","t",false,240011));assert(!c.begin(replacement,"r","t",true,240011));
+ assert(c.begin(replacement,"r","t",false,480011));assert(!c.begin(replacement,"r","t",true,480011));
  assert(c.active.entries[0].hash[0]==1);c.pending.verified=true;fail=true;
- assert(c.commit("owner-a",replacement.id,240012,save,nullptr));assert(c.active.entries[0].hash[0]==1);
- fail=false;assert(!c.commit("owner-a",replacement.id,240013,save,nullptr));
+ assert(c.commit("owner-a",replacement.id,480012,save,nullptr));assert(c.active.entries[0].hash[0]==1);
+ fail=false;assert(!c.commit("owner-a",replacement.id,480013,save,nullptr));
  assert(c.active.entries[0].hash[0]==5);assert(valid(c.active));
  auto damaged=c.active;damaged.entries[0].hash[0]^=1;assert(!valid(damaged));
  assert(!c.revoke(replacement.id,save,nullptr));n=writes;assert(!c.revoke(replacement.id,save,nullptr)&&writes==n);

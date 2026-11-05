@@ -169,20 +169,21 @@ esp_err_t handle(httpd_req_t* r){
    !strcmp(path,"/api/test-fan")||!strcmp(path,"/api/lockoff");
  const bool settingsRoute=!strcmp(path,"/api/settings");
  const bool statsRoute=!strcmp(path,"/api/stats");
+ const bool statsRangeRoute=!strcmp(path,"/api/stats/range");
  const bool eventsRoute=!strcmp(path,"/api/events");
  const bool leaseRoute=!strcmp(path,"/api/lease");
  const bool settingsPost=settingsRoute&&r->method==HTTP_POST;
- if(!statusRoute&&!requestRoute&&!writeRoute&&!settingsRoute&&!statsRoute&&!eventsRoute&&!leaseRoute)return fail(r,"404 Not Found","NOT_FOUND");
+ if(!statusRoute&&!requestRoute&&!writeRoute&&!settingsRoute&&!statsRoute&&!statsRangeRoute&&!eventsRoute&&!leaseRoute)return fail(r,"404 Not Found","NOT_FOUND");
  if(statusRoute&&r->method!=HTTP_GET)return fail(r,"405 Method Not Allowed","METHOD_NOT_ALLOWED");
  if(requestRoute&&r->method!=HTTP_GET)return fail(r,"405 Method Not Allowed","METHOD_NOT_ALLOWED");
  if(writeRoute&&r->method!=HTTP_POST)return fail(r,"405 Method Not Allowed","METHOD_NOT_ALLOWED");
- if((statsRoute||eventsRoute)&&r->method!=HTTP_GET)return fail(r,"405 Method Not Allowed","METHOD_NOT_ALLOWED");
+ if((statsRoute||statsRangeRoute||eventsRoute)&&r->method!=HTTP_GET)return fail(r,"405 Method Not Allowed","METHOD_NOT_ALLOWED");
  if(settingsRoute&&r->method!=HTTP_GET&&r->method!=HTTP_POST)return fail(r,"405 Method Not Allowed","METHOD_NOT_ALLOWED");
  if(leaseRoute&&r->method!=HTTP_POST)return fail(r,"405 Method Not Allowed","METHOD_NOT_ALLOWED");
  if(statusRoute&&(r->content_len||httpd_req_get_hdr_value_len(r,"Transfer-Encoding")))return fail(r,"400 Bad Request","BODY_NOT_ALLOWED");
  if(requestRoute&&(r->content_len||httpd_req_get_hdr_value_len(r,"Transfer-Encoding")))return fail(r,"400 Bad Request","BODY_NOT_ALLOWED");
  if((writeRoute||settingsPost||leaseRoute)&&(r->content_len==0||r->content_len>256||httpd_req_get_hdr_value_len(r,"Transfer-Encoding")))return fail(r,"400 Bad Request","INVALID_BODY");
- if(!settingsPost&&(settingsRoute||statsRoute||eventsRoute)&&(r->content_len||httpd_req_get_hdr_value_len(r,"Transfer-Encoding")))return fail(r,"400 Bad Request","BODY_NOT_ALLOWED");
+ if(!settingsPost&&(settingsRoute||statsRangeRoute||eventsRoute)&&(r->content_len||httpd_req_get_hdr_value_len(r,"Transfer-Encoding")))return fail(r,"400 Bad Request","BODY_NOT_ALLOWED");
  if(!wifiBindingReady())return fail(r,"503 Service Unavailable","RESOURCE_BUSY");
  char authorization[128]{};size_t n=httpd_req_get_hdr_value_len(r,"Authorization");
  if(n!=50||httpd_req_get_hdr_value_str(r,"Authorization",authorization,sizeof(authorization))!=ESP_OK||strncmp(authorization,"Bearer ",7))
@@ -200,7 +201,7 @@ esp_err_t handle(httpd_req_t* r){
  // 这样第二台手机可以在第一台 WiFi 主控仍在线时完成绑定。
  if(!(auth.pending&&statusRoute)&&!leaseAllowed(auth.tokenId,now))return fail(r,"423 Locked","WIFI_IN_USE");
  if(!rateAllowed(auth.tokenId,now))return fail(r,"429 Too Many Requests","RATE_LIMITED");
- if((settingsRoute||statsRoute||eventsRoute)&&!settingsPost){
+ if((settingsRoute||statsRoute||statsRangeRoute||eventsRoute)&&!settingsPost){
   char query[160]{};const bool hasQuery=httpd_req_get_url_query_str(r,query,sizeof(query))==ESP_OK;
   ControlApiRequest request;request.method="GET";request.path=path;
   const String profile=hasQuery?queryValue(query,"profile"):String();
@@ -208,6 +209,11 @@ esp_err_t handle(httpd_req_t* r){
   if(statsRoute){
    request.mode=hasQuery?queryValue(query,"mode"):String("today");
    request.eventOffset=hasQuery?queryValue(query,"offset"):String();
+  }
+  if(statsRangeRoute){
+   request.rangeFrom=queryValue(query,"from");
+   request.rangeTo=queryValue(query,"to");
+   request.rangeTz=queryValue(query,"tzOffsetSeconds");
   }
   if(eventsRoute){
    request.eventStart=queryValue(query,"start");
@@ -304,9 +310,14 @@ void stop(){if(server){httpd_ssl_stop(server);server=nullptr;portENTER_CRITICAL(
 void start(){
  loadWrites();
  const auto caps=MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT;
- // 含绑定和快照的真机 TLS 峰值约 38 KiB；56 KiB 门槛保留约 18 KiB 余量。
- if(heap_caps_get_free_size(caps)<56*1024||heap_caps_get_largest_free_block(caps)<20*1024){Serial.println("[wifi-read] resource gate blocked");return;}
- httpd_ssl_config_t c=HTTPD_SSL_CONFIG_DEFAULT();c.httpd.stack_size=16384;c.httpd.max_open_sockets=1;c.httpd.backlog_conn=1;c.httpd.lru_purge_enable=true;
+ // schema 5 的常驻统计缓冲（daily[30]+events[512]≈19.6KB）把空闲堆压到 ~50KB，
+ // 原来的 56 KiB 门槛让 WiFi 服务永远起不来（串口 ready=0 resource gate blocked）。
+ // TLS 峰值约 38 KiB，真正的硬约束是最大连续块，空闲堆作为次要下限。
+ if(heap_caps_get_free_size(caps)<48*1024||heap_caps_get_largest_free_block(caps)<20*1024){Serial.println("[wifi-read] resource gate blocked");return;}
+ if(heap_caps_get_free_size(caps)<56*1024){Serial.printf("[wifi-read] low heap pass: %u\n",heap_caps_get_free_size(caps));}
+ // 栈从 16KB 降到 10KB：实测 TLS 握手期间 heap 只剩 6KB、最大块 1.5KB，
+ // 16KB 的 httpd 栈本身就会挤占握手缓冲，导致 mbedtls 分配失败。
+ httpd_ssl_config_t c=HTTPD_SSL_CONFIG_DEFAULT();c.httpd.stack_size=10240;c.httpd.max_open_sockets=1;c.httpd.backlog_conn=1;c.httpd.lru_purge_enable=true;
  c.httpd.recv_wait_timeout=10;c.httpd.send_wait_timeout=10;c.httpd.uri_match_fn=httpd_uri_match_wildcard;
  c.port_secure=8443;c.tls_handshake_timeout_ms=10000;
  c.servercert=wifiDeviceCertificate(&c.servercert_len);c.prvtkey_pem=wifiDevicePrivateKey(&c.prvtkey_len);c.user_cb=tlsEvent;

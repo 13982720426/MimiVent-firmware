@@ -34,6 +34,8 @@ class StatisticsBucketRetentionTest(unittest.TestCase):
             self.assertEqual(segment['events'][0]['triggerCount'],3)
             self.assertEqual(segment['events'][0]['durationSeconds'],60)
             self.assertEqual(sum(rows['activity_segment_restored']['activityBucketSeconds']),60)
-            self.assertEqual(sum(day['runtimeSeconds'] for day in rows['active_threeDays']['days']),7200)
+            self.assertEqual(
+                sum(day['runtimeSeconds'] for day in rows['active_threeDays']['days']),
+                7200)
             self.assertTrue(rows['events']['eventsTruncated'])
             self.assertEqual(rows['reset']['runtimeSeconds'],0)

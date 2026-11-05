@@ -15,19 +15,21 @@ TimingSettings settingsStoreGet(TimingProfile) { return {30000, 30000, 120000, 6
 void emit(const char* name,const String& json) { std::cout << name << '\t' << json.c_str() << '\n'; }
 int main() {
   statisticsStoreBegin();
-  assert(statisticsStoreSchemaVersion()==4);
+  assert(statisticsStoreSchemaVersion()==7);
   assert(statisticsStoreSetClock(fakeNow,480));
   statisticsStoreRecordActivity(120);
   fakeNow+=30; statisticsStoreRecordActivity(120);
   fakeNow+=30; statisticsStoreRecordActivity(120);
   emit("activity_segment",statisticsStoreBuildJson("today",false,0,0));
+  // 固件 loop 里由 statisticsStoreTick 负责把合并写入落盘，这里同样推进一次。
+  fakeMillis+=6000; statisticsStoreTick();
   memset(daily,0,sizeof(daily)); memset(events,0,sizeof(events));
   dailyCount=eventCount=generation=0; ready=false;
   statisticsStoreBegin();
   emit("activity_segment_restored",statisticsStoreBuildJson("today",false,0,0));
   statisticsStoreFanStarted(kForce,0);
   for(int i=0;i<600;i++) { statisticsStoreRecordActivity(60); fakeNow+=61; }
-  assert(eventCount==512);
+  assert(eventCount==256);
   assert(activeRun.id!=0); // 明细可淘汰，但运行结算状态不能丢。
   fakeNow+=7200;
   emit("active_today",statisticsStoreBuildJson("today",true,7200000,0));
@@ -40,7 +42,7 @@ int main() {
   emit("sevenDays",statisticsStoreBuildJson("sevenDays",false,0,0));
   emit("events",statisticsStoreBuildEventsJson(fakeNow-86400,fakeNow+1,"all",0,32,0,0));
   memset(daily,0,sizeof(daily)); memset(events,0,sizeof(events));
-  dailyCount=eventCount=generation=0; droppedThroughEpoch=0; ready=false;
+  dailyCount=eventCount=generation=0; droppedThrough=0; ready=false;
   statisticsStoreBegin();
   emit("restored",statisticsStoreBuildJson("threeDays",false,0,0));
   // 旧 schema 数据无法按新结构加载，必须切换数据批次。

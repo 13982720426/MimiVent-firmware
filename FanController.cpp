@@ -23,7 +23,8 @@ uint8_t relayOnLevel() { return AppConfig::kRelayActiveLow ? LOW : HIGH; }
 
 uint8_t relayOffLevel() { return AppConfig::kRelayActiveLow ? HIGH : LOW; }
 
-void setFan(bool turnOn, unsigned long nowMs) {
+void setFan(bool turnOn, unsigned long nowMs,
+            StatisticsEndReason stopReason = StatisticsEndReason::COMPLETED) {
   if (fanOn == turnOn) return;
   if (turnOn) {
     uint8_t kind = 3;  // 临时排风
@@ -32,7 +33,7 @@ void setFan(bool turnOn, unsigned long nowMs) {
     statisticsStoreFanStarted(kind, nowMs,
         kind == 2 ? static_cast<uint16_t>(phaseDurationMs / 1000UL) : 0);
   } else {
-    statisticsStoreFanStopped(nowMs - fanStartedMs);
+    statisticsStoreFanStopped(nowMs - fanStartedMs, stopReason);
   }
   fanOn = turnOn;
   fanStartedMs = fanOn ? nowMs : 0;
@@ -44,7 +45,7 @@ void enterOccupied(unsigned long nowMs, const char* reason) {
   autoPhase = AutoPhase::OCCUPIED;
   phaseStartedMs = nowMs;
   phaseDurationMs = 0;
-  setFan(false, nowMs);
+  setFan(false, nowMs, StatisticsEndReason::PIR_INTERRUPTED);
   Serial.printf("[%lu ms] Activity: %s; fan stopped, waiting for PIR LOW\n", nowMs,
                 reason);
 }
@@ -294,7 +295,7 @@ void fanControllerStartTimedPause(unsigned long durationMs, unsigned long nowMs)
   controlMode = ControlMode::TIMED_OFF;
   overrideStartedMs = nowMs;
   overrideDurationMs = durationMs;
-  setFan(false, nowMs);
+  setFan(false, nowMs, StatisticsEndReason::CANCELLED);
   statisticsStoreRecordTimedPause(durationMs);
   Serial.printf("Timed pause started for %lu ms\n", durationMs);
 }
@@ -304,6 +305,7 @@ void fanControllerStartForceTest(unsigned long durationMs, unsigned long nowMs) 
   controlMode = ControlMode::FORCE_TEST;
   overrideStartedMs = nowMs;
   overrideDurationMs = durationMs;
+  setFan(false, nowMs, StatisticsEndReason::REPLACED);
   setFan(true, nowMs);
   Serial.printf("Force fan test started for %lu ms (PIR ignored)\n", durationMs);
 }
@@ -315,7 +317,7 @@ void fanControllerSetAuto(unsigned long nowMs, FanControlSource source) {
   }
   controlMode = ControlMode::AUTO;
   overrideDurationMs = 0;
-  setFan(false, nowMs);
+  setFan(false, nowMs, StatisticsEndReason::CANCELLED);
   if (autoPhase == AutoPhase::STARTUP_COOLDOWN) {
     Serial.println("Control mode: automatic sensing (startup cooldown continues)");
     return;
@@ -330,7 +332,7 @@ void fanControllerSetLockedOff(unsigned long nowMs, FanControlSource source) {
   skipStartupCooldown(nowMs);
   controlMode = ControlMode::LOCKED_OFF;
   overrideDurationMs = 0;
-  setFan(false, nowMs);
+  setFan(false, nowMs, StatisticsEndReason::CANCELLED);
   if (source == FanControlSource::USER) statisticsStoreRecordLockedOff();
   Serial.println("Control mode: locked off");
 }

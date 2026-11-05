@@ -18,6 +18,9 @@ struct ControlApiRequest {
   String eventBeforeId;
   String eventDataEpoch;
   String eventLimit;
+  String rangeFrom;
+  String rangeTo;
+  String rangeTz;
   String body;
   bool replace = false;
   bool switchProfile = false;

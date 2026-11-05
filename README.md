@@ -1,6 +1,6 @@
 # MimiVent
 
-ESP32-C3-DevKitM-1 单猫砂盆自动排风固件，通过 MimiVent App 的 BLE 或 WiFi 控制设备。当前基础方案使用 **1 个猫砂盆、1 个 PIR、1 台风机**；设备开机后先执行启动冷静期，再进入 PIR 自动感应。手机页面可查看 PIR/风机状态，临时强制开/关均可设定时长，另有需要二次确认的持续关闭锁。三通、第二段支管和第二个 PIR 是连接第二个猫砂盆时才需要的可选扩展，不属于当前基础方案的必需配件。当前固件版本为 `v0.5.1`，配套 App `v0.5.1`；上一正式固件为 `v0.4.0`。WiFi 配网与 HTTPS 控制已完成用户真机验证。变化见 [CHANGELOG.md](CHANGELOG.md)。
+ESP32-C3-DevKitM-1 单猫砂盆自动排风固件，通过 MimiVent App 的 BLE 或 WiFi 控制设备。当前基础方案使用 **1 个猫砂盆、1 个 PIR、1 台风机**；设备开机后先执行启动冷静期，再进入 PIR 自动感应。手机页面可查看 PIR/风机状态，临时强制开/关均可设定时长，另有需要二次确认的持续关闭锁。三通、第二段支管和第二个 PIR 是连接第二个猫砂盆时才需要的可选扩展，不属于当前基础方案的必需配件。当前固件版本为 `v0.6.0`，配套 App `v0.6.0`；上一正式固件为 `v0.5.1`。WiFi 配网与 HTTPS 控制已完成用户真机验证。变化见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 项目启动前准备
 
@@ -34,7 +34,7 @@ ESP32-C3-DevKitM-1 单猫砂盆自动排风固件，通过 MimiVent App 的 BLE 
 - macOS、Windows 或 Linux 均可开发；Arduino IDE 2.x 可用于编辑、编译和烧录。本项目不要求 Windows。
 - 需要安装的软件：Arduino IDE 2.x、Espressif Systems 的 `esp32` 板卡包、`Adafruit NeoPixel` 库、`NimBLE-Arduino` 库。
 - `WiFi`、ESP-IDF HTTPS/TLS 和 `Preferences`（NVS 配置存储）库由 ESP32 Arduino core 自带，不要在 Library Manager 里另外安装同名库。
-- 当前构建组合：Arduino IDE 2.3.10、ESP32 Arduino core `esp32:esp32` 3.3.12、Adafruit NeoPixel 1.15.5、NimBLE-Arduino 2.5.1。v0.4.0 已通过 Arduino CLI 编译及 USB 烧录校验，并完成 BLE OTA 完整包/差分包、暂停续传、安装重连核验和任务放弃/替换真机验证；v0.5.0 为 WiFi 功能版本；v0.5.1 将 WiFi 绑定上限提升到 3 个，需与 App v0.5.1 配套。应用槽上限为 1,769,472 字节。
+- 当前构建组合：Arduino IDE 2.3.10、ESP32 Arduino core `esp32:esp32` 3.3.12、Adafruit NeoPixel 1.15.5、NimBLE-Arduino 2.5.1。v0.4.0 已通过 Arduino CLI 编译及 USB 烧录校验，并完成 BLE OTA 完整包/差分包、暂停续传、安装重连核验和任务放弃/替换真机验证；v0.5.0 为 WiFi 功能版本；v0.5.1 将 WiFi 绑定上限提升到 3 个；v0.6.0 统计存储升到 schema 7（事件容量 512 → 256）并将 WiFi 响应改为短键，需与 App v0.6.0 配套。应用槽上限为 1,769,472 字节。
 - 将本仓库整个项目目录放在 Arduino sketchbook 下，保持目录名和主 `.ino` 文件名一致：`MimiVent/MimiVent.ino`。
 - 首次接线烧录时使用 USB 数据线连接开发板；在 IDE 中选择对应串口和 `ESP32C3 Dev Module` 板卡配置。
 
@@ -266,7 +266,7 @@ PIR 模块自身输出 HIGH 的保持时间由模块电位器控制；软件离�
 
 ## 版本与兼容性
 
-- 当前版本：`v0.5.1`，配套 App `v0.5.1`；WiFi 开发调试版本统一归入本次更新。上一正式固件为 `v0.4.0`。
+- 当前版本：`v0.6.0`，配套 App `v0.6.0`；上一正式固件为 `v0.5.1`。
 - `FirmwareVersion.h` 是固件版本来源；最低 BLE v2 App 为 `0.3.0`，完整 WiFi 与新统计界面推荐使用本次 App。
 - `v0.4.0` 已提供 BLE v2、签名压缩/差分 OTA、续传、独立安装及 schema 4 统计。本次在其上增加 WiFi，不重复列为新 OTA 功能。
 - 从 `v0.3.1` 旧分区及 BLE v1 首次迁移需 USB 烧录；旧 App 不具备本次 WiFi 配网/绑定能力。

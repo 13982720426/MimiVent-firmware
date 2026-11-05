@@ -66,6 +66,8 @@ void setup() {
   Serial.printf("MimiVent v%s ready\n", FIRMWARE_VERSION);
   Serial.println(FIRMWARE_IMAGE_MARKER);
   Serial.println(FIRMWARE_STATISTICS_SCHEMA_MARKER);
+  // 镜像内必须带这个标记：OTA 校验靠它判断目标固件能读的最低落盘格式。
+  Serial.println(FIRMWARE_MIN_READABLE_STATISTICS_SCHEMA_MARKER);
   Serial.println(FIRMWARE_PARTITION_PROFILE_MARKER);
   Serial.printf("BLE device: %s\n", AppConfig::kBleDeviceName);
   Serial.println("Partition table:");
@@ -120,6 +122,8 @@ void loop() {
   controlApiLock();
   fanControllerUpdate(nowMs);
   controlApiUnlock();
+  // 合并写入的活动增量在空闲时也要落盘，不能等到下一次触发。
+  statisticsStoreTick();
 
   static unsigned long lastStatusLedUpdateMs = 0;
   if (nowMs - lastStatusLedUpdateMs >= 20UL) {

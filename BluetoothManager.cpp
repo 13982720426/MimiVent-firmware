@@ -104,6 +104,11 @@ bool parsePacket(const String& packet, ControlApiRequest* request) {
   if (request->path == "/api/stats") {
     request->eventOffset = formValue(body, "offset");
   }
+  if (request->path == "/api/stats/range") {
+    request->rangeFrom = formValue(body, "from");
+    request->rangeTo = formValue(body, "to");
+    request->rangeTz = formValue(body, "tzOffsetSeconds");
+  }
   if (request->path == "/api/events") {
     request->eventStart = formValue(body, "start");
     request->eventEnd = formValue(body, "end");

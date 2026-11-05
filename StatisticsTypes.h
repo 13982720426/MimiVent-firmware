@@ -36,6 +36,9 @@ enum class StatisticsProfile : uint8_t {
 };
 
 enum class StatisticsEndReason : uint8_t {
+  // 迁移前的旧记录：语义是"未知"，不是"已完成"。零值必须是未知，
+  // 因为结构体被 memset/默认构造时该字段自然是 0，否则会伪造一次成功完成。
+  LEGACY_UNKNOWN = 0,
   COMPLETED = 1,
   REPLACED = 2,
   RESTARTED = 3,
@@ -67,6 +70,21 @@ using ZoneId = uint16_t;
 using StatisticsEventId = uint32_t;
 using StatisticsOperationId = uint32_t;
 using StatisticsRunId = uint32_t;
+
+// 事件级标志。与 StoreHeader 的 flags 是不同字段，位编号各自独立、不可混用。
+// 未校时状态只能用这个位表达：禁止借用 unixSeconds 的高位，否则与 2038 年后的
+// 真实时间戳冲突。
+constexpr uint8_t kEventFlagTimeUnsynced = 1u << 0;
+
+// 每日汇总的指标覆盖位与溢出位共用同一套位映射。
+constexpr uint8_t kMetricRuntime = 1u << 0;
+constexpr uint8_t kMetricActivityCount = 1u << 1;
+constexpr uint8_t kMetricActivitySegmentCount = 1u << 2;
+constexpr uint8_t kMetricActivitySpanSeconds = 1u << 3;
+constexpr uint8_t kMetricActivityTriggerBuckets = 1u << 4;
+constexpr uint8_t kMetricActivitySegmentBuckets = 1u << 5;
+constexpr uint8_t kMetricActivitySpanBuckets = 1u << 6;
+constexpr uint8_t kMetricToilet = 1u << 7;
 
 constexpr SensorId kDefaultSensorId = 1;
 constexpr FanId kDefaultFanId = 1;

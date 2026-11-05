@@ -18,6 +18,7 @@ def image(version: str, body: bytes) -> bytes:
         f"MIMIVENT_FIRMWARE_VERSION={version}\0"
         "MIMIVENT_PARTITION_PROFILE=statistics-v2-ota-v1\0"
         "MIMIVENT_STATISTICS_SCHEMA=3\0"
+        "MIMIVENT_MIN_READABLE_STORAGE_SCHEMA=2\0"
     ).encode()
     return markers + b"\0" * (4096 - len(markers)) + body
 
@@ -47,6 +48,7 @@ class OtaDeltaBuilderTest(unittest.TestCase):
             self.assertIn(b"Verified OK", verified.stdout)
 
         self.assertEqual(delta[:8], b"MVDLT1\0\0")
+        self.assertEqual(struct.unpack_from("<H", delta, 162)[0], 2)
         self.assertEqual(delta[24:56], hashlib.sha256(base).digest())
         self.assertEqual(delta[56:88], hashlib.sha256(target).digest())
         self.assertEqual(struct.unpack_from("<I", delta, 188)[0], zlib.crc32(delta[:188]))
