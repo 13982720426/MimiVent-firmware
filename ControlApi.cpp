@@ -1,15 +1,17 @@
-#include "WifiHttpsServer.h"
 // 统一维护设备业务规则，传输层只负责解析请求和发送响应。
 #include "ControlApi.h"
+#include "WifiCapabilities.h"
 
 #include <cstdio>
 #include <cstdlib>
+#include <utility>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 
 #include "AppConfig.h"
 #include "FanController.h"
 #include "FirmwareVersion.h"
+#include "OtaManager.h"
 #include "StatisticsStore.h"
 #include "AppConfig.h"
 #include "WifiProvisioningManager.h"
@@ -24,6 +26,13 @@ TimingProfile lockOffProfile = TimingProfile::PRODUCTION;
 
 ControlApiResponse response(uint16_t code, const char* type, const String& body) {
   return {code, type, body};
+}
+
+// 右值重载：把响应体直接移进返回对象，避免为整份响应再分配一次堆副本。
+// 统计查询的响应体最大可达数 KB，复制一份会显著抬高峰值占用。
+// 调用方传临时对象（如 statisticsStoreBuildJson(...)）时自动走这条路径。
+ControlApiResponse response(uint16_t code, const char* type, String&& body) {
+  return {code, type, std::move(body)};
 }
 
 ControlApiResponse jsonError(uint16_t code, const char* message) {
@@ -71,16 +80,11 @@ ControlApiResponse statusResponse(TimingProfile viewProfile) {
   const FanControllerStatus status = fanControllerGetStatus(millis());
   const TimingSettings active = settingsStoreGet(status.activeProfile);
 #if MIMIVENT_ENABLE_WIFI
-#if MIMIVENT_WIFI_READ_CONTROL
-  const char* kCapabilities = wifiHttpsServerReady()
-      ? "[\"ble.control\",\"ble.stats\",\"ble.ota\",\"wifi.configure\",\"wifi.bind\",\"wifi.read\"]"
-      : "[\"ble.control\",\"ble.stats\",\"ble.ota\",\"wifi.configure\"]";
-#else
-  constexpr char kCapabilities[] = "[\"ble.control\",\"ble.stats\",\"ble.ota\",\"wifi.configure\"]";
-#endif
+  const char* kCapabilities =
+      wifiCapabilitiesJson(true, MIMIVENT_WIFI_READ_CONTROL != 0);
   constexpr uint8_t kGattVersion = 2;
 #else
-  constexpr char kCapabilities[] = "[\"ble.control\",\"ble.stats\",\"ble.ota\"]";
+  const char* kCapabilities = wifiCapabilitiesJson(false, false);
   constexpr uint8_t kGattVersion = 1;
 #endif
   // 新增 storageSchema / minReadableStorageSchema 后需重新核算长度，避免被 snprintf 截断。
@@ -194,8 +198,12 @@ ControlApiResponse controlApiDispatch(const ControlApiRequest& request) {
     Guard() { controlApiLock(); }
     ~Guard() { controlApiUnlock(); }
   } guard;
+  if(request.hasDeadline&&uint32_t(millis()-request.issuedAtMs)>request.maxAgeMs)
+    return {409,"application/json","{\"error\":\"COMMAND_EXPIRED\"}"};
   if (request.path == "/api/status" && request.method == "GET") return statusResponse(request.profile);
   if (request.path == "/api/events" && request.method == "GET") {
+    // OTA 期间拒绝统计查询：两侧各需近 10-19 KB 连续堆，叠加会挤爆。
+    if (otaManagerIsActive()) return jsonError(423, "OTA_BUSY");
     unsigned long start = 0;
     unsigned long end = 0;
     unsigned long offset = 0;
@@ -236,6 +244,7 @@ ControlApiResponse controlApiDispatch(const ControlApiRequest& request) {
                         status.fanRunMs, static_cast<uint32_t>(beforeId)));
   }
   if (request.path == "/api/stats/range" && request.method == "GET") {
+    if (otaManagerIsActive()) return jsonError(423, "OTA_BUSY");
     unsigned long rangeFrom = 0;
     unsigned long rangeTo = 0;
     if (!parseUnsignedParameter(request.rangeFrom, &rangeFrom) ||
@@ -253,7 +262,7 @@ ControlApiResponse controlApiDispatch(const ControlApiRequest& request) {
       }
     }
     uint8_t rangeError = 0;
-    const String body = statisticsStoreBuildRangeJson(
+    String body = statisticsStoreBuildRangeJson(
         static_cast<uint32_t>(rangeFrom), static_cast<uint32_t>(rangeTo),
         static_cast<int32_t>(offsetSeconds), &rangeError);
     switch (static_cast<StatisticsRangeError>(rangeError)) {
@@ -266,9 +275,11 @@ ControlApiResponse controlApiDispatch(const ControlApiRequest& request) {
       case StatisticsRangeError::kNotReady: return jsonError(503, "STATS_NOT_READY");
       case StatisticsRangeError::kNone: break;
     }
-    return response(200, "application/json; charset=utf-8", body);
+    // body 到这里已无其它持有者，移进响应避免再复制一整份统计结果。
+    return response(200, "application/json; charset=utf-8", std::move(body));
   }
   if (request.path == "/api/stats" && request.method == "GET") {
+    if (otaManagerIsActive()) return jsonError(423, "OTA_BUSY");
     const FanControllerStatus status = fanControllerGetStatus(millis());
     unsigned long eventOffset = 0;
     if (request.eventOffset.length()) {
@@ -278,9 +289,16 @@ ControlApiResponse controlApiDispatch(const ControlApiRequest& request) {
         return jsonError(400, "INVALID_EVENT_OFFSET");
       }
     }
+    unsigned long eventLimit = 32;
+    if (request.eventLimit.length() &&
+        (!parseUnsignedParameter(request.eventLimit, &eventLimit) ||
+         eventLimit < 1 || eventLimit > 32)) {
+      return jsonError(400, "INVALID_EVENT_LIMIT");
+    }
     return response(200, "application/json; charset=utf-8",
                     statisticsStoreBuildJson(request.mode, status.fanOn, status.fanRunMs,
-                                             static_cast<uint16_t>(eventOffset)));
+                                             static_cast<uint16_t>(eventOffset),
+                                             static_cast<uint8_t>(eventLimit)));
   }
   if (request.path == "/api/time" && request.method == "POST") {
     const String epochText = formValue(request.body, "unixTime");
@@ -293,8 +311,10 @@ ControlApiResponse controlApiDispatch(const ControlApiRequest& request) {
     if (end == offsetText.c_str() || *end != '\0' || offset < -720 || offset > 840) {
       return jsonError(400, "INVALID_TIMEZONE_OFFSET");
     }
-    if (!statisticsStoreSetClock(epoch, static_cast<int16_t>(offset))) {
-      return jsonError(400, "INVALID_TIME");
+    if (!statisticsStoreClockSyncSafe()) return jsonError(409, "TIME_SYNC_DEFERRED");
+    if (!statisticsStoreSetClockFromSource(epoch, static_cast<int16_t>(offset),
+                                           StatisticsClockSource::kPhone)) {
+      return jsonError(409, "TIME_SYNC_CONFLICT");
     }
     return jsonOk("{\"synced\":true}");
   }

@@ -16,8 +16,7 @@
 #include "OtaBleAdapter.h"
 #include "OtaCompression.h"
 #include "OtaTransferWorkspace.h"
-#include "WifiTlsResourceProbe.h"
-#include "WifiHttpsServer.h"
+#include "WifiMqttTransport.h"
 #include "WifiProvisioningManager.h"
 #include <esp_heap_caps.h>
 #include "StatisticsStore.h"
@@ -27,7 +26,13 @@ constexpr uint32_t kTransferTimeoutMs = 30000;
 constexpr uint32_t kMaxFirmwareBytes = 1769472;
 constexpr uint32_t kCheckpointBytes = 16 * 1024;
 constexpr uint32_t kEraseSectorBytes = 4096;
-constexpr uint32_t kOtaPackageBlockBytes = 16 * 1024;
+// 完整包块大小。实测 OTA 时堆碎片严重：8 KB 块（input+output 共 16 KB）
+// 申请后最大连续块只剩 7668 B，仍拿不到 tinfl 状态所需的约 11 KB，报
+// ERROR|MEMORY。4 KB 块只占 8 KB，能给解压状态留出约 15 KB，是能同时
+// 满足两者的大小。代价是块数变为 4 倍、flash 写入次数增加。
+// 注意：把工作区改回静态（MIMIVENT_OTA_DYNAMIC_WORKSPACE=0）会多占约 33 KB
+// BSS，实测会导致 BLE_INIT Malloc failed 与 MQTT 连接失败，不可用。
+constexpr uint32_t kOtaPackageBlockBytes = 4 * 1024;
 constexpr uint32_t kOtaSignatureBytes = 384;
 constexpr uint32_t kOtaPackageFixedHeaderBytes = 128 + kOtaSignatureBytes;
 constexpr uint32_t kOtaPackageDescriptorBytes = 16;
@@ -759,6 +764,8 @@ void beginUpdate(const Message& message) {
     setStatus("ERROR|CHECKPOINT_STORE"); return;
   }
   if (active) { setStatus("ERROR|BUSY"); return; }
+  // 失败状态和后续 QUERY 都归属于当前已授权 BLE 会话。
+  ownerConnection = message.connection;
   const String packet(reinterpret_cast<const char*>(message.bytes), message.length);
   const bool packageMode = packet.startsWith("BEGIN2|");
   const bool deltaMode = packet.startsWith("BEGIN_DELTA|");
@@ -969,22 +976,29 @@ void beginUpdate(const Message& message) {
     targetPartition = nullptr;
     setStatus("ERROR|FLASH_PARTITION"); return;
   }
-#if MIMIVENT_ENABLE_WIFI && MIMIVENT_WIFI_TLS_PROBE
-  wifiTlsResourceProbeSuspendForOta();
-#endif
 #if MIMIVENT_ENABLE_WIFI && MIMIVENT_WIFI_READ_CONTROL
-  wifiHttpsServerSuspendForOta();
+  // MQTT 是 WiFi/MQTT 控制通道，但 OTA 使用 BLE 独立通道。
+  // 先释放客户端、队列和 MQTT 任务的堆，再申请两个 OTA 块缓冲。
+  wifiMqttSuspendForOta();
 #endif
   bool memoryReady=prepareTransferMemory(packageMode, deltaMode);
 #if MIMIVENT_ENABLE_WIFI && MIMIVENT_WIFI_READ_CONTROL
   if(!memoryReady){
-    // TLS/RF 生命周期后的碎片可能使大块不足；Flash 尚未开始写入，只重试一次。
+    // 释放 WiFi 配网资源后的碎片可能使大块不足；Flash 尚未开始写入，只重试一次。
     wifiProvisioningSuspendForOta();
     memoryReady=prepareTransferMemory(packageMode,deltaMode);
   }
 #endif
   if (!memoryReady) {
-    setStatus("ERROR|MEMORY");
+    // 带上实际内存数字：App 只能看到通用错误码时无从判断是碎片还是容量不足。
+    // 格式与串口 [ota-memory] 一致，便于对照。
+    const auto caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
+    char detail[96];
+    snprintf(detail, sizeof(detail), "ERROR|MEMORY|block=%u|free=%u|largest=%u",
+             static_cast<unsigned>(packageMode ? kOtaPackageBlockBytes : kOtaDeltaBlockBytes),
+             static_cast<unsigned>(heap_caps_get_free_size(caps)),
+             static_cast<unsigned>(heap_caps_get_largest_free_block(caps)));
+    setStatus(detail);
     return;
   }
   esp_err_t beginResult;

@@ -2,7 +2,7 @@
 #if MIMIVENT_ENABLE_WIFI && MIMIVENT_WIFI_READ_CONTROL
 #include "WifiBindingCore.h"
 #include "WifiDeviceIdentity.h"
-#include "WifiHttpsServer.h"
+#include "WifiControlLease.h"
 #include "WifiStorageBudget.h"
 #include "OtaCheckpointStore.h"
 #include <WiFi.h>
@@ -152,6 +152,29 @@ bool wifiBindingRevokeAllowed(const char* owner,const char* tokenId){
  portEXIT_CRITICAL(&mux);
  return !found||allowed;
 }
+bool wifiBindingAddAuthTokens(cJSON* state){
+ if(!state||!ready)return false;
+ Record snapshot{};
+ portENTER_CRITICAL(&mux);snapshot=authActive;portEXIT_CRITICAL(&mux);
+ auto* tokens=cJSON_AddArrayToObject(state,"authTokens");
+ if(!tokens)return false;
+ constexpr char hex[]="0123456789abcdef";
+ for(const auto& entry:snapshot.entries){
+  if(!entry.used)continue;
+  auto* token=cJSON_CreateObject();
+  if(!token)return false;
+  char hash[65]{};
+  for(size_t i=0;i<sizeof(entry.hash);++i){
+   hash[i*2]=hex[entry.hash[i]>>4];
+   hash[i*2+1]=hex[entry.hash[i]&0x0f];
+  }
+  const bool added=cJSON_AddStringToObject(token,"tokenId",entry.id)&&
+                   cJSON_AddStringToObject(token,"tokenHash",hash);
+  if(!added){cJSON_Delete(token);return false;}
+  cJSON_AddItemToArray(tokens,token);
+ }
+ return true;
+}
 bool wifiBindingMarkVerified(const char* tokenId){Verified event{};strncpy(event.id,tokenId,32);return verifiedQueue&&xQueueSend(verifiedQueue,&event,0)==pdTRUE;}
 String wifiBindingRequest(cJSON* root,const char* owner){
  if(!ready)return error(storeState);
@@ -159,12 +182,12 @@ String wifiBindingRequest(cJSON* root,const char* owner){
  wifiBindingUpdate();const char* op=field(root,"op");const char* id=field(root,"tokenId");
  auto* out=cJSON_CreateObject();const char* failure=nullptr;const auto now=millis();
  if(!strcmp(op,"wifi.bind.open")){
-  if(!wifiHttpsServerReady())failure="WIFI_UNAVAILABLE";
+  if(WiFi.status()!=WL_CONNECTED)failure="WIFI_UNAVAILABLE";
   else failure=core.open(owner,now);
   cJSON_AddNumberToObject(out,"expiresInSec",120);
  }else if(!strcmp(op,"wifi.bind.begin")){
   nvs_stats_t stats{};bool hasTable=false;for(const auto& entry:core.active.entries)hasTable|=entry.used!=0;
-  if(!wifiHttpsServerReady())failure="WIFI_UNAVAILABLE";
+  if(WiFi.status()!=WL_CONNECTED)failure="WIFI_UNAVAILABLE";
   else if(nvs_get_stats(nullptr,&stats)!=ESP_OK)failure="STORAGE_UNAVAILABLE";
   else if(!core.pending.exists&&!WifiStorageBudget::allowsBinding(stats.free_entries,hasTable))failure="WIFI_STORAGE_LOW";
   else if(!label(field(root,"clientId"),36)||!uuidValid(field(root,"requestId")))failure="INVALID_REQUEST";
@@ -180,6 +203,12 @@ String wifiBindingRequest(cJSON* root,const char* owner){
     cJSON_AddStringToObject(out,"bindingState","pending");cJSON_AddNumberToObject(out,"expiresInSec",(kTtlMs-uint32_t(now-core.pending.started))/1000);
    }
   }
+ }else if(!strcmp(op,"wifi.bind.verify")){
+  const char* token=field(root,"token");
+  const auto auth=wifiBindingAuthorize(token,now);
+  if(!id[0]||!auth.valid||!auth.pending||strcmp(auth.tokenId,id))failure="BINDING_TOKEN_INVALID";
+  else if(!wifiBindingMarkVerified(id))failure="RESOURCE_BUSY";
+  else {wifiBindingUpdate();cJSON_AddBoolToObject(out,"verified",true);}
  }else if(!strcmp(op,"wifi.bind.status")){
   const char* state=core.status(owner,id,now);
   if(!strcmp(state,"forbidden"))failure="PERMISSION_DENIED";
@@ -191,7 +220,7 @@ String wifiBindingRequest(cJSON* root,const char* owner){
   if(strcmp(field(root,"confirm"),"RESET_ALL_BINDINGS"))failure="CONFIRMATION_REQUIRED";
   else {
    failure=core.reset(save,nullptr);
-   if(!failure){wifiHttpsResetLease();cJSON_AddStringToObject(out,"bindingState","reset");}
+   if(!failure){wifiControlLeaseReset();cJSON_AddStringToObject(out,"bindingState","reset");}
   }
  }
  else if(!strcmp(op,"wifi.revoke")){

@@ -12,7 +12,8 @@ from pathlib import Path
 
 MAGIC = b"MVOTA2\0\0"
 HEADER_SIZE = 512
-BLOCK_SIZE = 16 * 1024
+# 必须与 OtaManager.cpp 的 kOtaPackageBlockBytes 保持一致。
+BLOCK_SIZE = 4 * 1024
 
 
 def marker(image: bytes, name: str) -> str:

@@ -13,8 +13,7 @@ constexpr uint8_t kSummaryRetentionDays = 30;
 constexpr size_t kStatisticsPartitionBytes = 512UL * 1024UL;
 
 // 事件明细容量：条数与保留天数谁先到就按谁截断。
-// 512 条（10 KB 常驻）把 BLE+WiFi 双栈下的空闲堆压到 18 KB，正好卡在
-// 一次 TLS 会话的临界点上，导致 WiFi 握手时成时败。256 条腾出 5 KB。
+// 512 条时常驻记录额外占用约 5 KB；256 条为 BLE 与 WiFi/MQTT 共存释放这部分堆。
 // 实际覆盖范围约 3 天（App 的明细入口也收敛到今天/昨天/前天）。
 constexpr size_t kEventCapacity = 256;
 

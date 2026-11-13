@@ -1,6 +1,6 @@
 #include "WifiProvisioningManager.h"
 #include "WifiBindingStore.h"
-#include "WifiHttpsServer.h"
+#include "WifiMqttTransport.h"
 #include "WifiDeviceIdentity.h"
 #include "OtaManager.h"
 #include "WifiLegacyStorage.h"
@@ -109,7 +109,8 @@ String errorResponse(const char* code) {
 
 void addWifiStatus(cJSON* root) {
 #if MIMIVENT_WIFI_READ_CONTROL
-  cJSON_AddBoolToObject(root,"wifiReadAvailable",wifiHttpsServerReady());
+  cJSON_AddBoolToObject(root,"mqttConfigured",wifiMqttConfigured());
+  cJSON_AddBoolToObject(root,"mqttConnected",wifiMqttConnected());
   cJSON_AddStringToObject(root,"deviceId",wifiDeviceId());
   cJSON_AddStringToObject(root,"identityState",wifiDeviceIdentityState());
   cJSON_AddStringToObject(root,"bindingsState",wifiBindingState());
@@ -369,11 +370,13 @@ String handleRequest(const String& request, const char* owner) {
     // 设备扫描与 BLE 共存时内存不足，所有客户端统一使用手机侧扫描。
     result = errorResponse("SCAN_UNSUPPORTED");
   } else if (op == "wifi.configure") {
+#if MIMIVENT_WIFI_READ_CONTROL
     if (!wifiBindingOwnerAllowed(owner)) {
       result = errorResponse("PERMISSION_DENIED");
       cJSON_Delete(root);
       return result;
     }
+#endif
     cJSON* clientItem = cJSON_GetObjectItemCaseSensitive(root, "clientId");
     cJSON* requestItem = cJSON_GetObjectItemCaseSensitive(root, "requestId");
     cJSON* payload = cJSON_GetObjectItemCaseSensitive(root, "payload");
@@ -472,6 +475,9 @@ void wifiProvisioningBegin() {
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
   WiFi.setAutoReconnect(true);
+#if MIMIVENT_WIFI_READ_CONTROL
+  wifiMqttBegin();
+#endif
   credentialsLoaded = loadCredentials();
   if (credentialsLoaded) {
     activeRequestId = savedCredentials.requestId;
@@ -486,7 +492,7 @@ void wifiProvisioningBegin() {
 void wifiProvisioningUpdate() {
 #if MIMIVENT_WIFI_READ_CONTROL
   if(otaRadioSuspended){
-    if(otaManagerIsActive())return;
+    if(otaManagerIsActive()){wifiMqttUpdate();return;}
     otaRadioSuspended=false;WiFi.mode(WIFI_STA);WiFi.setSleep(false);WiFi.setAutoReconnect(true);
     if(credentialsLoaded){
       WiFi.begin(savedCredentials.ssid,savedCredentials.password);
@@ -505,6 +511,9 @@ void wifiProvisioningUpdate() {
   if (state == WifiState::kScanning && WiFi.scanComplete() != WIFI_SCAN_RUNNING) {
     // 由 wifi.scan 查询路径收集结果，保留扫描态直到客户端拉取快照。
   }
+#if MIMIVENT_WIFI_READ_CONTROL
+  wifiMqttUpdate();
+#endif
 }
 
 String wifiProvisioningHandleRequest(const String& request,const String& owner) {
@@ -517,6 +526,9 @@ String wifiProvisioningHandleRequest(const String& request,const String& owner) 
     }
     if(cJSON_IsString(v)&&(strncmp(v->valuestring,"wifi.bind.",10)==0||!strcmp(v->valuestring,"wifi.clients")||!strcmp(v->valuestring,"wifi.revoke"))){
       String result=wifiBindingRequest(root,owner.c_str());cJSON_Delete(root);return result;
+    }
+    if(cJSON_IsString(v)&&strncmp(v->valuestring,"wifi.mqtt.",10)==0){
+      String result=wifiMqttHandleRequest(root,owner.c_str());cJSON_Delete(root);return result;
     }
     cJSON_Delete(root);
   }

@@ -18,13 +18,14 @@
 #include "StatisticsStore.h"
 #include "OtaManager.h"
 #include "ControlApi.h"
-#include "WifiTlsResourceProbe.h"
 #include "WifiDeviceIdentity.h"
-#include "WifiHttpsServer.h"
+#include "WifiMqttTransport.h"
+#include "WifiControlService.h"
+#include "WifiBindingStore.h"
 #include <esp_partition.h>
 #include <esp_ota_ops.h>
 
-#if MIMIVENT_ENABLE_WIFI && (MIMIVENT_WIFI_TLS_PROBE || MIMIVENT_WIFI_READ_CONTROL)
+#if MIMIVENT_ENABLE_WIFI && MIMIVENT_WIFI_READ_CONTROL
 // P3 实测镜像查询/验签调用链在 8 KiB loop 栈下仅余约 596 B。
 // 仅实验构建增加 2 KiB，重新测量堆余量后再决定生产配置。
 SET_LOOP_TASK_STACK_SIZE(10240);
@@ -55,9 +56,7 @@ void setup() {
 #endif
 #if MIMIVENT_ENABLE_WIFI && MIMIVENT_WIFI_READ_CONTROL
   wifiBindingBegin();
-#endif
-#if MIMIVENT_ENABLE_WIFI && MIMIVENT_WIFI_TLS_PROBE
-  wifiTlsResourceProbeBegin();
+  wifiControlServiceBegin();
 #endif
   bluetoothManagerBegin();
   otaManagerConfirmBoot();
@@ -109,21 +108,20 @@ void setup() {
 
 void loop() {
 #if MIMIVENT_ENABLE_WIFI && MIMIVENT_WIFI_READ_CONTROL
-  wifiHttpsServerUpdate();
+  wifiControlServiceUpdate();
 #endif
   // 先处理 BLE 命令，再读取时钟。命令处理器可能刚设置 overrideStartedMs；
   // 若使用处理请求之前保存的 nowMs，unsigned 差值会下溢并让定时模式立即到期。
   bluetoothManagerUpdate();
-#if MIMIVENT_ENABLE_WIFI && MIMIVENT_WIFI_TLS_PROBE
-  wifiTlsResourceProbeUpdate();
-#endif
-
   const unsigned long nowMs = millis();
   controlApiLock();
   fanControllerUpdate(nowMs);
   controlApiUnlock();
   // 合并写入的活动增量在空闲时也要落盘，不能等到下一次触发。
+  // 与 ControlApi 的读写共用同一把锁，避免 MQTT 校时任务并发修改统计状态。
+  controlApiLock();
   statisticsStoreTick();
+  controlApiUnlock();
 
   static unsigned long lastStatusLedUpdateMs = 0;
   if (nowMs - lastStatusLedUpdateMs >= 20UL) {
@@ -131,5 +129,24 @@ void loop() {
     statusLedUpdate(fanControllerIsFanOn(), nowMs);
   }
 
-  delay(1);  // 让出少量 CPU 时间，保持网页请求响应及时。
+  // 内存基线：free / largest / min 三者必须同 capability，否则不可比。
+  // 放在 loop 里是因为 BLE 与 MQTT 的连接状态在这里都能读到。
+  // 判读：free 单调下滑不恢复→泄漏；free 稳而 largest 下滑→碎片；
+  //       仅统计查询时骤降→峰值问题。
+  static unsigned long lastMemLogMs = 0;
+  if (nowMs - lastMemLogMs >= 60000UL) {
+    lastMemLogMs = nowMs;
+    const uint32_t caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
+    bool mqttIsConnected = false;
+#if MIMIVENT_ENABLE_WIFI && MIMIVENT_WIFI_READ_CONTROL
+    mqttIsConnected = wifiMqttConnected();
+#endif
+    Serial.printf("[mem] free=%u largest=%u min=%u mqtt=%d\n",
+                  static_cast<unsigned>(heap_caps_get_free_size(caps)),
+                  static_cast<unsigned>(heap_caps_get_largest_free_block(caps)),
+                  static_cast<unsigned>(heap_caps_get_minimum_free_size(caps)),
+                  mqttIsConnected ? 1 : 0);
+  }
+
+  delay(1);  // 让出少量 CPU 时间，保持 BLE 与 MQTT 任务及时运行。
 }

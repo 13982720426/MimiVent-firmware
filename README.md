@@ -1,6 +1,6 @@
 # MimiVent
 
-ESP32-C3-DevKitM-1 单猫砂盆自动排风固件，通过 MimiVent App 的 BLE 或 WiFi 控制设备。当前基础方案使用 **1 个猫砂盆、1 个 PIR、1 台风机**；设备开机后先执行启动冷静期，再进入 PIR 自动感应。手机页面可查看 PIR/风机状态，临时强制开/关均可设定时长，另有需要二次确认的持续关闭锁。三通、第二段支管和第二个 PIR 是连接第二个猫砂盆时才需要的可选扩展，不属于当前基础方案的必需配件。当前固件版本为 `v0.6.0`，配套 App `v0.6.0`；上一正式固件为 `v0.5.1`。WiFi 配网与 HTTPS 控制已完成用户真机验证。变化见 [CHANGELOG.md](CHANGELOG.md)。
+ESP32-C3-DevKitM-1 单猫砂盆自动排风固件，通过 MimiVent App 的 BLE 或本地 NAS/MQTT 控制设备。当前基础方案使用 **1 个猫砂盆、1 个 PIR、1 台风机**；设备开机后先执行启动冷静期，再进入 PIR 自动感应。手机页面可查看 PIR/风机状态，临时强制开/关均可设定时长，另有需要二次确认的持续关闭锁。三通、第二段支管和第二个 PIR 是连接第二个猫砂盆时才需要的可选扩展，不属于当前基础方案的必需配件。当前发布固件为 `v0.7.0`，配套 App 为 `v0.7.0+11`，最低 App 版本为 `v0.7.0`。设备端 HTTPS 已从源码和构建中移除。版本从主分支固件 `v0.6.0` 递增。变化见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 项目启动前准备
 
@@ -68,7 +68,7 @@ ESP32-C3-DevKitM-1 单猫砂盆自动排风固件，通过 MimiVent App 的 BLE 
 1. 用 USB 数据线连接 ESP32-C3-DevKitM-1。
 2. 从 IDE 顶部的开发板选择器中选择 **ESP32C3 Dev Module**。如果列表中没有该选项，先确认 Espressif `esp32` 板卡包已经安装完成。
 3. 在 **Tools（工具）** 菜单确认板型为 `ESP32C3 Dev Module`，选择开发板插入后出现的 **Port（端口）**。端口名称因操作系统和 USB 转串口芯片而异；不确定时可拔插开发板，观察哪个端口随之消失/出现。
-4. 本项目使用板载 4MB Flash。当前版本使用根目录的 `partitions.csv`，包含双 OTA 应用槽和 512 KiB 统计分区；不要改用旧版 `Minimal SPIFFS` 或默认分区。完整 WiFi 版本还依赖项目隔离的 TLS 4 KiB SDK 副本，推荐使用下方构建脚本；IDE 默认编译不会自动启用本版 WiFi 构建参数。若工具菜单显示 **Flash Size（闪存大小）**，选择 `4MB (32Mb)`。
+4. 本项目使用板载 4MB Flash。当前版本使用根目录的 `partitions.csv`，包含双 OTA 应用槽和 512 KiB 统计分区；不要改用旧版 `Minimal SPIFFS` 或默认分区。完整 WiFi/MQTT 版本推荐使用下方构建脚本；IDE 默认编译不会自动启用本版 WiFi 构建参数。若工具菜单显示 **Flash Size（闪存大小）**，选择 `4MB (32Mb)`。
 
 ### 接线前安全检查
 
@@ -150,20 +150,7 @@ bash scripts/build_firmware.sh read4k
 
 输出为 `build/firmware-wifi-read4k/MimiVent.ino.bin`，脚本输出实际字节数及 SHA-256。必须确认镜像不超过 1,769,472 字节，并检查构建目录中的 `partitions.csv` 与仓库一致。
 
-此模式启用 `MIMIVENT_ENABLE_WIFI=1`、`MIMIVENT_WIFI_READ_CONTROL=1` 和动态 OTA 工作区，并使用 `build/sdk-tls-4096` 中的隔离 SDK。该目录不入库，新环境必须先准备：
-
-1. 取得脚本锁定的 mbedTLS 官方源码归档 `9d669eadb1955d348986b9280156710aaaadf79f`，存为 `build/mbedtls-9d669ead.tar.gz` 并解压为 `build/mbedtls-9d669eadb1955d348986b9280156710aaaadf79f`。
-2. 指定本机 ESP32-C3 SDK 与工具链目录，生成副本；脚本核对源码 SHA-256、SDK 版本和头文件，不修改全局 SDK。锁定 ESP-IDF `v5.5.5 b774170ff46`，不可混用其他 core 的库。
-
-```sh
-python3 scripts/build_tls_sdk_overlay.py \
-  --sdk /path/to/esp32c3-sdk \
-  --toolchain /path/to/riscv32-esp-elf-toolchain \
-  --content-bytes 4096
-bash scripts/build_firmware.sh read4k
-```
-
-`--toolchain` 指向直接包含 `riscv32-esp-elf-gcc` 的 `bin` 目录。具体校验与源码归档哈希以脚本为准；缺失副本或校验不符会停止构建，不能用其他模式冒充完整 WiFi 版本。
+此模式启用 `MIMIVENT_ENABLE_WIFI=1`、`MIMIVENT_WIFI_READ_CONTROL=1` 和动态 OTA 工作区。设备 HTTPS 与 TLS 服务专属 SDK 覆盖已移除，不再需要构建 mbedTLS SDK overlay。
 
 连接开发板，选择实际串口后上传同一构建：
 
@@ -176,7 +163,7 @@ arduino-cli upload \
 
 首次从旧分区布局迁移需经 USB 写入正确分区表；正常 OTA 不改分区表。不执行整片擦除，也不随意格式化统计分区。重启后检查串口版本、实际分区和下一 OTA 槽，随后验证 App 状态、控制、统计及网络恢复。
 
-仅 BLE 基线可用 `bash scripts/build_firmware.sh off` 编译。`on` 只启用配网，不等同完整 HTTPS 控制；`probe*`、`identity4k`、`pairprobe4k` 是诊断模式，不作为发布包。
+仅 BLE 基线可用 `bash scripts/build_firmware.sh off` 编译。`on` 只启用配网，不包含 NAS/MQTT 控制；`read4k` 是完整 WiFi/MQTT 构建。
 
 ## BLE OTA 升级与签名
 
@@ -192,8 +179,8 @@ App 菜单“固件升级”选择签名 `.mvota` 完整包，或基线镜像匹
 
 ## 统计数据与同步
 
-- BLE 与 WiFi 共用 `ControlApi` 及统计存储。App 经 BLE 连接后校准手机 Unix 时间和 UTC 偏移；首次可信校时后固定统计时区，按本地自然日查询。
-- 采用 schema 4、512 条事件上限和 SPIFFS 双槽快照；每日汇总保留 30 天，明细最多 10 天，亦受事件容量限制。事件淘汰后运行汇总仍可能存在，不能据此判定数据丢失或统计矛盾。
+- BLE 与 WiFi/MQTT 共用 `ControlApi` 及统计存储。BLE 授权流程负责首次冻结统计时区并可校准手机 UTC；WiFi/NAS 在 MQTT 就绪后单独校准 UTC，不覆盖设备时区。两条链路各自重连时都要触发并取得设备校时回执。
+- 落盘格式为 schema 7，事件明细最多 256 条、最多保留 10 天（当前通常约覆盖 3 天），每日汇总保留 30 天；统计 API 的兼容字段仍报告 schema 4。事件淘汰后运行汇总仍可能存在，不能据此判定数据丢失或统计矛盾。
 - 运行汇总按小时累计，包含自动、临时、强制排风和当前运行；风机运行期间不每秒写 Flash，结束时保存最终时长。重启未完成运行标记为中断。
 - 未校时事件可在本次开机首次校时后回填；在校时前再次断电，无法还原可靠自然日。已初始化分区挂载失败时禁用统计并保留现场，不自动格式化历史数据。
 - `GET /api/stats?mode=today|yesterday|threeDays|sevenDays` 返回汇总和图表；`GET /api/events` 支持时间范围、类型筛选和事件 ID 游标分页。`toiletAverageSeconds` 和 `toiletSampleCount` 由全部有效自动排风样本汇总，App 不依赖最近 32 条事件计算平均值。App 负责活动分组与展示。
@@ -219,21 +206,21 @@ App 菜单“固件升级”选择签名 `.mvota` 完整包，或基线镜像匹
 
 ## 蓝牙控制
 
-设备提供 BLE 控制，并在 v0.5.0 起支持 WiFi STA 配网与 HTTPS 控制。MimiVent App 可通过 BLE 读取状态、配置时序、控制风机、校准时间、读取统计并执行 OTA；WiFi 通道复用同一 `ControlApi` 业务规则，不重新实现控制逻辑。
+设备提供 BLE 控制，并支持 WiFi STA 配网和 NAS/MQTT 控制。MimiVent App 可通过 BLE 读取状态、配置时序、控制风机、校准时间、读取统计并执行 OTA；NAS/MQTT 通道复用同一 `ControlApi` 业务规则，不重新实现控制逻辑。
 
-设备不启动 SoftAP 或内嵌网页控制台；v0.5.0 的 WiFi STA 仅提供 HTTPS API。正式版 v0.3.1 只有 BLE v1 控制通道，不包含 OTA GATT 通道；从 v0.3.1 首次升级到 v0.4.0 必须通过 USB 烧录，完成首刷后可由 App 经 BLE OTA 升级。
+设备不启动 SoftAP、内嵌网页控制台或 HTTPS 服务。正式版 v0.3.1 只有 BLE v1 控制通道，不包含 OTA GATT 通道；从 v0.3.1 首次升级到 v0.4.0 必须通过 USB 烧录，完成首刷后可由 App 经 BLE OTA 升级。
 
 ## WiFi 配网与控制
 
 - App 经独立的安全 BLE 服务下发 WiFi 凭据；Android 手机搜索网络，设备不执行 WiFi 扫描，避免 BLE/WiFi 共存时内存不足。
 - 配网要求 BLE 已加密并 bonding。无屏设备采用系统配对，不执行 MITM 身份认证或自定义六位码验证；在可信设备附近操作。
 - 支持 2.4 GHz WPA2-Personal 与 WPA2/WPA3-Personal 混合网络；凭据保存在 NVS，开机恢复连接。App 不保存 WiFi 密码，日志不记录密码或完整配网正文。
-- HTTPS `8443` 提供状态、设置、控制、统计、事件与请求结果查询，使用设备证书固定和 Bearer token；不启动 SoftAP、明文 HTTP 或内嵌网页。
+- App 经认证 HTTPS 访问 NAS Gateway；Gateway 通过 MQTT 与设备交换控制、状态、统计查询和校时消息。设备端不开放 8443，也不保留 HTTPS 回退路径。
 - 绑定经安全 BLE 管理，设备最多保存三个有效客户端；支持待绑定、核验、幂等提交、撤销和清除全部绑定。清除绑定同时释放 WiFi 租约，不等于清除 WiFi 密码或全部设备数据。
 - 同时只有一份 WiFi 控制租约，空闲 20 秒过期，另一手机需等待释放/过期；BLE 控制与 WiFi 控制通过共享业务层协调。两份绑定不代表两路并行 WiFi 主控。
-- HTTPS 单连接、请求有界排队；写请求使用请求 ID 去重和结果查询，超时后先确认执行结果。
-- 校时仍经 BLE `/api/time` 完成，HTTPS 不提供该路由；断电重启后无可信时钟时，日期统计需等待校时。
-- OTA 仍只走 BLE。升级动态分配工作区，必要时释放 HTTPS 或暂停 WiFi 为 OTA 腾出内存，暂停/结束后恢复网络服务。
+- 写请求使用请求 ID 去重和结果查询，超时后先确认执行结果；控制去重与绑定生命周期独立于任何 Web 服务。
+- BLE 连接和 WiFi/NAS MQTT 会话分别触发 UTC 校时。统计时区首次由 BLE/授权流程固定；NAS 只提供 UTC，时区未冻结时等待 BLE 初始化后重试。
+- OTA 仍只走 BLE。升级动态分配工作区，必要时暂停 WiFi/MQTT 为 OTA 腾出内存，暂停/结束后恢复网络服务。
 
 ## 时序配置
 
@@ -262,14 +249,14 @@ PIR 模块自身输出 HIGH 的保持时间由模块电位器控制；软件离�
 
 ## 固件模块
 
-主程序 `MimiVent.ino` 负责模块初始化和循环调度。`ControlApi` 维护业务规则，`BluetoothManager` 提供 BLE 控制，`WifiProvisioningManager`/`WifiHttpsServer` 提供 WiFi 配网与 HTTPS 控制，`OtaManager` 管理 OTA 任务和分区写入，`StatisticsStore` 管理统计存储；WiFi 传输适配层复用同一业务接口。
+主程序 `MimiVent.ino` 负责模块初始化和循环调度。`ControlApi` 维护业务规则，`BluetoothManager` 提供 BLE 控制，`WifiProvisioningManager` 管理 WiFi 配网，`WifiMqttTransport` 与 `WifiControlService` 提供 NAS/MQTT 控制和读取，`OtaManager` 管理 BLE OTA 任务和分区写入，`StatisticsStore` 管理统计存储。ESP32 不再运行 HTTPS 服务。
 
 ## 版本与兼容性
 
-- 当前版本：`v0.6.0`，配套 App `v0.6.0`；上一正式固件为 `v0.5.1`。
-- `FirmwareVersion.h` 是固件版本来源；最低 BLE v2 App 为 `0.3.0`，完整 WiFi 与新统计界面推荐使用本次 App。
-- `v0.4.0` 已提供 BLE v2、签名压缩/差分 OTA、续传、独立安装及 schema 4 统计。本次在其上增加 WiFi，不重复列为新 OTA 功能。
-- 从 `v0.3.1` 旧分区及 BLE v1 首次迁移需 USB 烧录；旧 App 不具备本次 WiFi 配网/绑定能力。
+- 当前发布版本：固件 `v0.7.0`，配套 App `v0.7.0+11`；最低 App 版本为 `v0.7.0`，最低支持固件也为 `v0.7.0`。版本从主分支 `v0.6.0` 递增。
+- `FirmwareVersion.h` 是固件版本来源；旧的 BLE v2 最低版本记录仅适用于历史固件，本版已要求 App 至少为 `v0.7.0`。
+- `v0.4.0` 引入 BLE v2、签名压缩/差分 OTA、续传、独立安装及 schema 4 统计；`v0.5.0` 增加 WiFi STA 配网与设备 HTTPS。本版移除设备 HTTPS，WiFi 控制、查询和校时改由 NAS/MQTT 提供。
+- 从 `v0.3.1` 旧分区及 BLE v1 首次迁移需 USB 烧录；低于 App `v0.7.0` 的版本不支持本版 NAS/MQTT 控制。
 - 正式发布前同步本文件、`CHANGELOG.md` 和版本头文件，再创建提交及同名 tag；本地提交和 tag 不代表远程 Release 或安装包已上传。
 
 ## 后续扩展

@@ -5,6 +5,7 @@
 #define FILE_READ "r"
 #define FILE_WRITE "w"
 inline std::map<std::string,std::vector<uint8_t>> files;
+inline bool spiffsWriteFailure=false;
 class File {
  std::vector<uint8_t>* bytes=nullptr; size_t pos=0;
  public:
@@ -20,6 +21,6 @@ struct SpiffsMock {
  bool begin(bool,const char*,int,const char*) { return true; }
  bool format() { files.clear(); return true; }
  void end() {}
- File open(const char* p,const char* mode) { if (*mode=='w') files[p].clear(); auto it=files.find(p); return it==files.end() ? File() : File(&it->second); }
+ File open(const char* p,const char* mode) { if (*mode=='w') {if(spiffsWriteFailure)return File();files[p].clear();} auto it=files.find(p); return it==files.end() ? File() : File(&it->second); }
 };
 inline SpiffsMock SPIFFS;

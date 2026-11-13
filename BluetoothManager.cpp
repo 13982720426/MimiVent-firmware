@@ -38,6 +38,7 @@ bool pendingRequestLegacy = false;
 uint16_t activeRequestId = 0;
 uint16_t peerMtu = kMinimumAttMtu;
 String queuedResponse;
+bool responseBufferReserved = false;
 bool queuedResponseLegacy = false;
 size_t queuedResponseOffset = 0;
 unsigned long lastResponseChunkMs = 0;
@@ -166,6 +167,12 @@ void writeU32(uint8_t* destination, uint32_t value) {
 
 void queueResponse(const ControlApiResponse& response, uint16_t requestId,
                    bool legacy = false) {
+  // 预分配容量后反复复用同一块缓冲：每秒一次的轮询若每次都重新分配
+  // 586 字节，会把堆切成碎片，WiFi TLS 握手随之失败。
+  if (!responseBufferReserved) {
+    queuedResponse.reserve(1280);
+    responseBufferReserved = true;
+  }
   queuedResponse = String(response.statusCode) + '\n' + response.body + '\n';
   queuedResponseLegacy = legacy;
   activeRequestId = requestId;

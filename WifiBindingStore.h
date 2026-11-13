@@ -15,4 +15,6 @@ WifiAuthorization wifiBindingAuthorize(const char* token,uint32_t now);
 bool wifiBindingMarkVerified(const char* tokenId);
 bool wifiBindingOwnerAllowed(const char* owner);
 bool wifiBindingRevokeAllowed(const char* owner,const char* tokenId);
+// 把当前有效绑定的 token 哈希附加到 MQTT 状态对象，供 NAS 校验只读授权；不发送明文 token。
+bool wifiBindingAddAuthTokens(cJSON* state);
 #endif

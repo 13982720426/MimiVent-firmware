@@ -75,6 +75,7 @@ using StatisticsRunId = uint32_t;
 // 未校时状态只能用这个位表达：禁止借用 unixSeconds 的高位，否则与 2038 年后的
 // 真实时间戳冲突。
 constexpr uint8_t kEventFlagTimeUnsynced = 1u << 0;
+constexpr uint8_t kEventFlagClockWentBackwards = 1u << 2;
 
 // 每日汇总的指标覆盖位与溢出位共用同一套位映射。
 constexpr uint8_t kMetricRuntime = 1u << 0;

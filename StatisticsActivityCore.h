@@ -66,3 +66,25 @@ inline bool statisticsActivityAccumulateDay(const StatisticsActivitySegment& seg
   }
   return true;
 }
+
+// schema 8 起逐小时桶为 uint16_t。单小时最多 3600 秒，正常数据不会超限；
+// 异常计时超限时饱和到 UINT16_MAX，避免回绕成小值。
+inline bool statisticsActivityAccumulateDay(const StatisticsActivitySegment& segment,
+                                            uint32_t dayStart,
+                                            uint16_t* buckets,
+                                            unsigned bucketCount) {
+  if (!buckets || bucketCount != 24 || !segment.first || segment.last < segment.first)
+    return false;
+  const uint64_t dayBegin = dayStart;
+  for (unsigned hour = 0; hour < 24; ++hour) {
+    const uint64_t begin = dayBegin + static_cast<uint64_t>(hour) * 3600;
+    const uint64_t end = begin + 3600;
+    const uint64_t from = segment.first > begin ? segment.first : begin;
+    const uint64_t to = segment.last < end ? segment.last : end;
+    if (to <= from) continue;
+    const uint64_t updated = static_cast<uint64_t>(buckets[hour]) + to - from;
+    buckets[hour] = updated > UINT16_MAX ? static_cast<uint16_t>(UINT16_MAX)
+                                         : static_cast<uint16_t>(updated);
+  }
+  return true;
+}

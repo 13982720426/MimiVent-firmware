@@ -25,6 +25,9 @@ struct ControlApiRequest {
   bool replace = false;
   bool switchProfile = false;
   bool hasSettings = false;
+  bool hasDeadline = false;
+  uint32_t issuedAtMs = 0;
+  uint32_t maxAgeMs = 0;
   TimingSettings settings{};
 };
 

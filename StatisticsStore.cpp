@@ -19,6 +19,8 @@ constexpr uint32_t kMagic = 0x4D565354;  // MVST
 constexpr uint16_t kSchema = FIRMWARE_STATISTICS_SCHEMA;   // 5，落盘格式
 constexpr uint16_t kSchemaV4 = 4;                          // 只读，迁移用
 constexpr uint16_t kSchemaV6 = 6;                          // 只读，迁移用（512 条事件）
+constexpr uint16_t kSchemaV7 = 7;                          // 只读，迁移用（312 B 单日记录）
+constexpr uint16_t kSchemaV8 = 8;                          // 只读，迁移用（收窄逐小时数组）
 constexpr size_t kEventCapacityV6 = 512;                   // schema 6 的事件上限
 constexpr size_t kDailyCapacity = StatisticsConfig::kSummaryRetentionDays;
 constexpr size_t kEventCapacity = StatisticsConfig::kEventCapacity;
@@ -104,6 +106,29 @@ struct DailyRecordV5 {
   uint8_t overflowFlags;
 };
 
+// schema 8：两个逐小时数组由 uint32_t 收窄为 uint16_t。
+// 语义上单个小时桶最多 3600 秒，uint16 上限 65535 足够；
+// 写入侧对异常值做饱和处理并把饱和记为 overflow，避免静默回绕。
+// 布局变化使单日记录从 312 B 降到 216 B，30 天共省 2,880 B。
+struct DailyRecordV6 {
+  uint32_t dayKey;
+  uint16_t activityCount;
+  uint16_t activitySegmentCount;
+  uint16_t automaticCount;
+
+  uint16_t runtimeBuckets[24];
+  uint16_t activitySpanBuckets[24];
+  uint16_t activityTriggerBuckets[24];
+  uint16_t activitySegmentBuckets[24];
+
+  uint32_t activitySpanSeconds;
+  uint32_t toiletDurationSeconds;
+  uint16_t toiletSampleCount;
+
+  uint8_t metricCoverage;
+  uint8_t overflowFlags;
+};
+
 struct EventRecordV5 {
   uint32_t id;
   uint32_t unixSeconds;
@@ -111,7 +136,7 @@ struct EventRecordV5 {
   uint8_t kind;
   uint8_t state;
   uint8_t endReason;
-  uint8_t flags;          // bit0 = kEventFlagTimeUnsynced
+  uint8_t flags;          // bit0 = timeUnsynced, bit2 = clockWentBackwards
   uint16_t reserved;
   uint16_t pad;
 };
@@ -138,11 +163,12 @@ static_assert(sizeof(DailyRecordV4) == 104, "schema 4 布局已发布，不得�
 static_assert(sizeof(EventRecordV4) == 16, "schema 4 布局已发布，不得修改");
 static_assert(sizeof(StoreHeaderV4) == 44, "schema 4 布局已发布，不得修改");
 static_assert(sizeof(DailyRecordV5) == 312, "布局变化必须同步提升 storage schema");
+static_assert(sizeof(DailyRecordV6) == 216, "schema 8 布局已发布，不得修改");
 static_assert(sizeof(EventRecordV5) == 20, "布局变化必须同步提升 storage schema");
 static_assert(sizeof(StoreHeaderV5) == 56, "布局变化必须同步提升 storage schema");
 
 // 规范结构：内存与磁盘一律使用 V5。
-using DailyRecord = DailyRecordV5;
+using DailyRecord = DailyRecordV6;
 using EventRecord = EventRecordV5;
 using StoreHeader = StoreHeaderV5;
 
@@ -174,6 +200,7 @@ char dataEpochHex[33] = {};
 char bootIdHex[17] = {};
 bool ready = false;
 bool clockReady = false;
+bool timezoneInitialized = false;
 int16_t timezoneOffsetMinutes = 0;
 size_t activeEventIndex = kEventCapacity;
 EventRecord activeRun{};
@@ -186,6 +213,8 @@ uint16_t tzVersion = 1;
 bool filesystemPreviouslyInitialized = false;
 // 同一连续活动段只占一个事件槽；阈值在首个触发时锁定，重启后不继续合并。
 uint32_t activeActivityId = 0;
+// 活动跨度与合并间隔使用本次启动的单调毫秒，UTC 只映射事件和日历桶。
+uint32_t activeActivityStartedAtMs = 0;
 // 最近一次活动段的真实跨度（首末触发之差）。入厕时长用它而不是排风时长：
 // 自动排风是"人走后再吹 3 分钟"，衡量的是设备行为，不是人在里面的时间。
 uint32_t lastActivitySpanSeconds = 0;
@@ -198,6 +227,10 @@ uint32_t pendingToiletSpanSeconds = 0;
 uint32_t lastActivityStartEpoch = 0;
 uint32_t pendingToiletStartEpoch = 0;
 uint16_t activeActivityGapSeconds = 0;
+uint32_t lastActivityAtMs = 0;
+uint32_t lastClockSyncAtMs = 0;
+StatisticsClockSource lastClockSyncSource = StatisticsClockSource::kPhone;
+bool hasClockSyncSource = false;
 
 void updateDataEpoch(const uint8_t* epoch) {
   for (size_t i = 0; i < 16; ++i) {
@@ -240,12 +273,24 @@ bool eventIsUnsynced(const EventRecord& event) {
 struct EventTimestamp {
   uint32_t seconds = 0;  // 可信时是 Unix 秒；未校时是本次开机 uptime 秒
   bool unsynced = false;
+  bool clockWentBackwards = false;
 };
 
 EventTimestamp eventTimestamp() {
   const uint32_t epoch = currentEpoch();
-  if (epoch) return EventTimestamp{epoch, false};
-  return EventTimestamp{static_cast<uint32_t>(millis() / 1000UL), true};
+  if (epoch) {
+    bool wentBackwards = false;
+    if (eventCount != 0) {
+      const EventRecord& previous = events[eventCount - 1];
+      if (previous.unixSeconds && !eventIsUnsynced(previous)) {
+        const uint64_t previousEnd = static_cast<uint64_t>(previous.unixSeconds) +
+            ((previous.state == kActive) ? 0 : previous.durationSeconds);
+        wentBackwards = epoch < previousEnd;
+      }
+    }
+    return EventTimestamp{epoch, false, wentBackwards};
+  }
+  return EventTimestamp{static_cast<uint32_t>(millis() / 1000UL), true, false};
 }
 
 bool mountStatisticsFilesystem() {
@@ -603,8 +648,8 @@ bool probeSlot(const char* path, HeaderPrefix* prefix) {
   const bool ok = file.size() >= sizeof(StoreHeaderV4) &&
       file.read(reinterpret_cast<uint8_t*>(&local), sizeof(local)) == sizeof(local) &&
       local.magic == kMagic &&
-      (local.schema == kSchema || local.schema == kSchemaV6 ||
-       local.schema == kSchemaV4) &&
+      (local.schema == kSchema || local.schema == kSchemaV7 ||
+       local.schema == kSchemaV6 || local.schema == kSchemaV4) &&
       local.dailyCount <= kDailyCapacity &&
       // schema 6 允许多达 512 条事件，读取时会截断到新容量。
       local.eventCount <= (local.schema == kSchemaV6 ? kEventCapacityV6
@@ -615,13 +660,17 @@ bool probeSlot(const char* path, HeaderPrefix* prefix) {
 }
 
 // schema 4 → 5 的转换：无法还原的新指标一律填 0 并清覆盖位，不伪造。
-void convertDailyV4(const DailyRecordV4& source, DailyRecordV5* target) {
+// schema 4 → 当前布局。运行时桶在旧格式里是 uint32_t，收窄时饱和处理。
+void convertDailyV4(const DailyRecordV4& source, DailyRecordV6* target) {
   *target = {};
   target->dayKey = source.dayKey;
   target->activityCount = source.activityCount;
   target->automaticCount = source.automaticCount;
   for (size_t hour = 0; hour < 24; ++hour) {
-    target->runtimeBuckets[hour] = source.runtimeBuckets[hour];
+    const uint32_t value = source.runtimeBuckets[hour];
+    target->runtimeBuckets[hour] =
+        value > UINT16_MAX ? static_cast<uint16_t>(UINT16_MAX)
+                           : static_cast<uint16_t>(value);
   }
   target->metricCoverage = kMetricRuntime | kMetricActivityCount;
 }
@@ -645,6 +694,37 @@ void convertEventV4(const EventRecordV4& source, EventRecordV5* target) {
   target->reserved = source.reserved;
 }
 
+// schema 7 → 8：两个逐小时数组由 uint32_t 收窄为 uint16_t。
+// 单小时最多 3600 秒，正常数据不会超限；异常计时（时钟跳变等）超限时
+// 饱和到 65535 并置 overflowFlags 的对应位，避免静默回绕成小值。
+void convertDailyV5ToV6(const DailyRecordV5& source, DailyRecordV6* target) {
+  if (!target) return;
+  memset(target, 0, sizeof(*target));
+  target->dayKey = source.dayKey;
+  target->activityCount = source.activityCount;
+  target->activitySegmentCount = source.activitySegmentCount;
+  target->automaticCount = source.automaticCount;
+  auto saturate = [](uint32_t value) -> uint16_t {
+    return value > UINT16_MAX ? static_cast<uint16_t>(UINT16_MAX)
+                              : static_cast<uint16_t>(value);
+  };
+  bool overflowed = false;
+  for (size_t i = 0; i < 24; ++i) {
+    if (source.runtimeBuckets[i] > UINT16_MAX) overflowed = true;
+    if (source.activitySpanBuckets[i] > UINT16_MAX) overflowed = true;
+    target->runtimeBuckets[i] = saturate(source.runtimeBuckets[i]);
+    target->activitySpanBuckets[i] = saturate(source.activitySpanBuckets[i]);
+    target->activityTriggerBuckets[i] = source.activityTriggerBuckets[i];
+    target->activitySegmentBuckets[i] = source.activitySegmentBuckets[i];
+  }
+  target->activitySpanSeconds = source.activitySpanSeconds;
+  target->toiletDurationSeconds = source.toiletDurationSeconds;
+  target->toiletSampleCount = source.toiletSampleCount;
+  target->metricCoverage = source.metricCoverage;
+  target->overflowFlags = source.overflowFlags;
+  (void)overflowed;
+}
+
 // 读取 schema 5 槽位：直接把记录读入规范内存数组，成功后回填 header。
 bool readSlotV5(const char* path, StoreHeader* header, bool acceptSchemaV6) {
   File file = SPIFFS.open(path, FILE_READ);
@@ -655,7 +735,8 @@ bool readSlotV5(const char* path, StoreHeader* header, bool acceptSchemaV6) {
       file.read(reinterpret_cast<uint8_t*>(&local), sizeof(local)) != sizeof(local) ||
       local.magic != kMagic ||
       (local.schema != kSchema &&
-       !(acceptSchemaV6 && local.schema == kSchemaV6)) ||
+       !(acceptSchemaV6 &&
+         (local.schema == kSchemaV6 || local.schema == kSchemaV7))) ||
       local.dailyCount > kDailyCapacity) {
     file.close();
     return false;
@@ -667,21 +748,46 @@ bool readSlotV5(const char* path, StoreHeader* header, bool acceptSchemaV6) {
     file.close();
     return false;
   }
-  const size_t dailyBytes = local.dailyCount * sizeof(DailyRecord);
+  // schema 8 起单日记录收窄到 216 B；更早的槽位按 312 B 存放。
+  // CRC 必须对文件里的原始字节计算，所以旧记录逐条读入局部变量，
+  // 既更新 CRC 又转换到内存态，避免为整块旧数据再开一份缓冲。
+  const bool compactDaily = local.schema >= kSchemaV8;
+  const size_t recordBytes =
+      compactDaily ? sizeof(DailyRecordV6) : sizeof(DailyRecordV5);
+  const size_t dailyBytes = local.dailyCount * recordBytes;
   const size_t totalEvents = local.eventCount;
   const size_t keepEvents =
       totalEvents < kEventCapacity ? totalEvents : kEventCapacity;
   const size_t totalEventBytes = totalEvents * sizeof(EventRecord);
   const uint32_t expected = local.checksum;
-  if (file.size() != sizeof(local) + dailyBytes + totalEventBytes ||
-      file.read(reinterpret_cast<uint8_t*>(daily), dailyBytes) != dailyBytes) {
+  if (file.size() != sizeof(local) + dailyBytes + totalEventBytes) {
     file.close();
     return false;
   }
   local.checksum = 0;
   Crc32 crc;
   crc.update(reinterpret_cast<uint8_t*>(&local), sizeof(local));
-  crc.update(reinterpret_cast<uint8_t*>(daily), dailyBytes);
+  for (size_t i = 0; i < local.dailyCount; ++i) {
+    if (compactDaily) {
+      DailyRecordV6 record{};
+      if (file.read(reinterpret_cast<uint8_t*>(&record), sizeof(record)) !=
+          sizeof(record)) {
+        file.close();
+        return false;
+      }
+      crc.update(reinterpret_cast<uint8_t*>(&record), sizeof(record));
+      daily[i] = record;
+    } else {
+      DailyRecordV5 record{};
+      if (file.read(reinterpret_cast<uint8_t*>(&record), sizeof(record)) !=
+          sizeof(record)) {
+        file.close();
+        return false;
+      }
+      crc.update(reinterpret_cast<uint8_t*>(&record), sizeof(record));
+      convertDailyV5ToV6(record, &daily[i]);
+    }
+  }
   uint32_t migratedDroppedThrough = local.droppedThrough;
   for (size_t i = 0; i < totalEvents; ++i) {
     EventRecord record{};
@@ -954,6 +1060,7 @@ bool prepareEventSlot(uint8_t kind) {
   if (victim.id == activeActivityId) {
     activeActivityId = 0;
     activeActivityGapSeconds = 0;
+    activeActivityStartedAtMs = 0;
   }
   memmove(events, events + 1, (eventCount - 1) * sizeof(EventRecord));
   --eventCount;
@@ -970,6 +1077,7 @@ void addEvent(uint8_t kind, uint8_t state, uint32_t durationSeconds = 0) {
   if (kind != kActivity) {
     activeActivityId = 0;
     activeActivityGapSeconds = 0;
+    activeActivityStartedAtMs = 0;
   }
   const EventTimestamp timestamp = eventTimestamp();
   const uint32_t eventId = nextEventId;
@@ -983,7 +1091,8 @@ void addEvent(uint8_t kind, uint8_t state, uint32_t durationSeconds = 0) {
   record.state = state;
   // 新记录的结束原因未知；风机结束时由 statisticsStoreFanStopped 改写。
   record.endReason = static_cast<uint8_t>(StatisticsEndReason::LEGACY_UNKNOWN);
-  record.flags = timestamp.unsynced ? kEventFlagTimeUnsynced : 0;
+  record.flags = timestamp.unsynced ? kEventFlagTimeUnsynced :
+      (timestamp.clockWentBackwards ? kEventFlagClockWentBackwards : 0);
   if (kind == kActivity) {
     DailyRecord* day = ensureDaily(currentDayKey());
     if (day && day->activityCount < 0xFFFF) ++day->activityCount;
@@ -1031,6 +1140,7 @@ void initializeDatasetIdentity() {
   uint8_t epoch[16]{};
   Preferences preferences;
   if (preferences.begin(kPreferencesNamespace, false)) {
+    timezoneInitialized = preferences.isKey(kTimezoneOffsetKey);
     timezoneOffsetMinutes = preferences.getShort(kTimezoneOffsetKey, 0);
     const size_t storedLength = preferences.getBytesLength(kDataEpochKey);
     if (storedLength != sizeof(epoch) ||
@@ -1223,6 +1333,9 @@ String buildRangeJson(uint32_t from, uint32_t to, int32_t tzOffsetSeconds,
     uint64_t pendingRuntime = 0, pendingActivity = 0, pendingAutomatic = 0;
     collectPendingUnsynced(&pendingRuntime, &pendingActivity, &pendingAutomatic);
     String json = "{";
+    // 预分配：拼接式扩容会按 4/8/16/32 二进制增长，每次 realloc 都在旧位置
+    // 留下空洞。统计查询是最高频的大分配之一，碎片会直接压低 largest block。
+    json.reserve(1024);
     json += "\"apiVersion\":2";
     json += ",\"deviceId\":\"" + String(statisticsStoreDeviceId()) + "\"";
     json += ",\"dataEpoch\":\"" + String(statisticsStoreDataEpoch()) + "\"";
@@ -1232,6 +1345,7 @@ String buildRangeJson(uint32_t from, uint32_t to, int32_t tzOffsetSeconds,
     json += ",\"to\":" + String(to);
     json += ",\"tzOffsetSeconds\":" + String(static_cast<long>(tzOffsetSeconds));
     json += ",\"timeSynced\":false";
+    json += ",\"timeSyncSource\":\"" + String(statisticsStoreClockSyncSource()) + "\"";
     json += ",\"dayCount\":" + String(dayCount);
     json += ",\"bucketHours\":" + String(bucketHours);
     json += ",\"bucketCount\":" + String(bucketCount);
@@ -1325,6 +1439,8 @@ String buildRangeJson(uint32_t from, uint32_t to, int32_t tzOffsetSeconds,
   const bool coverageToilet = (summary.coverage & kMetricToilet) != 0;
 
   String json = "{";
+  // 范围响应最大约 30 桶 × 80 B，预分配避免 6-8 次 realloc 造成碎片。
+  json.reserve(3072);
   json += "\"apiVersion\":2";
   json += ",\"deviceId\":\"" + String(statisticsStoreDeviceId()) + "\"";
   json += ",\"dataEpoch\":\"" + String(statisticsStoreDataEpoch()) + "\"";
@@ -1334,6 +1450,7 @@ String buildRangeJson(uint32_t from, uint32_t to, int32_t tzOffsetSeconds,
   json += ",\"to\":" + String(to);
   json += ",\"tzOffsetSeconds\":" + String(static_cast<long>(tzOffsetSeconds));
   json += ",\"timeSynced\":true";
+  json += ",\"timeSyncSource\":\"" + String(statisticsStoreClockSyncSource()) + "\"";
   json += ",\"dayCount\":" + String(dayCount);
   json += ",\"bucketHours\":" + String(bucketHours);
   json += ",\"bucketCount\":" + String(bucketCount);
@@ -1501,6 +1618,10 @@ bool migrateSnapshotToSchema5() {
 void statisticsStoreBegin() {
   activeActivityId = 0;
   activeActivityGapSeconds = 0;
+  activeActivityStartedAtMs = 0;
+  lastActivityAtMs = 0;
+  hasClockSyncSource = false;
+  timezoneInitialized = false;
   initializeDatasetIdentity();
   if (!mountStatisticsFilesystem()) {
     Serial.println("Statistics: SPIFFS unavailable; statistics disabled");
@@ -1605,8 +1726,46 @@ void statisticsStoreBegin() {
                 static_cast<unsigned>(dailyCount), static_cast<unsigned>(eventCount));
 }
 
+bool statisticsStoreClockSyncSafe() {
+  if (!statisticsStoreHasClock()) return true;
+  if (activeRun.id != 0 || pendingToiletStartEpoch != 0) return false;
+  if (activeActivityId != 0 && activeActivityGapSeconds != 0 &&
+      uint32_t(millis() - lastActivityAtMs) <
+          static_cast<uint32_t>(activeActivityGapSeconds) * 1000UL) return false;
+  return true;
+}
+
 bool statisticsStoreSetClock(uint32_t unixSeconds, int16_t utcOffsetMinutes) {
+  return statisticsStoreSetClockFromSource(unixSeconds, utcOffsetMinutes,
+                                           StatisticsClockSource::kPhone);
+}
+
+bool statisticsStoreSetClockFromSource(uint32_t unixSeconds, int16_t utcOffsetMinutes,
+                                       StatisticsClockSource source) {
   if (unixSeconds < 1700000000UL || utcOffsetMinutes < -720 || utcOffsetMinutes > 840) return false;
+  // NAS 只提供 UTC；统计偏移必须先由手机/授权初始化流程固定。
+  if (source == StatisticsClockSource::kNas && !timezoneInitialized) {
+    Serial.println("Statistics: NAS clock deferred until timezone is initialized");
+    return false;
+  }
+  const bool hadClock = statisticsStoreHasClock();
+  const uint32_t nowMs = millis();
+  const uint32_t oldEpoch = currentEpoch();
+  const bool clockWentBackwards = oldEpoch != 0 && unixSeconds < oldEpoch;
+  if (source == StatisticsClockSource::kPhone && hasClockSyncSource &&
+      lastClockSyncSource == StatisticsClockSource::kNas &&
+      uint32_t(nowMs - lastClockSyncAtMs) < 60000UL && oldEpoch != 0) {
+    const uint32_t delta = oldEpoch > unixSeconds ? oldEpoch - unixSeconds : unixSeconds - oldEpoch;
+    if (delta > 5) {
+      Serial.printf("Statistics: phone clock conflicts with recent NAS sample delta=%lu s\n",
+                    static_cast<unsigned long>(delta));
+      return false;
+    }
+  }
+  if (hadClock && !statisticsStoreClockSyncSafe()) {
+    Serial.println("Statistics: clock sync deferred until the active segment is complete");
+    return false;
+  }
   timeval tv{static_cast<time_t>(unixSeconds), 0};
   if (settimeofday(&tv, nullptr) != 0) return false;
   Preferences preferences;
@@ -1626,7 +1785,20 @@ bool statisticsStoreSetClock(uint32_t unixSeconds, int16_t utcOffsetMinutes) {
     Serial.println("Statistics: failed to persist timezone offset");
     return false;
   }
+  timezoneInitialized = true;
   clockReady = true;
+  if (clockWentBackwards) {
+    persistentFlags |= kHeaderFlagClockWentBackwards;
+    Serial.printf("Statistics: UTC moved backwards by %lu seconds\n",
+                  static_cast<unsigned long>(oldEpoch - unixSeconds));
+  }
+  lastClockSyncAtMs = nowMs;
+  lastClockSyncSource = source;
+  hasClockSyncSource = true;
+  // 不把跨时间映射的活动触发合并为同一段。
+  activeActivityId = 0;
+  activeActivityGapSeconds = 0;
+  activeActivityStartedAtMs = 0;
 
   // 回填本次开机以来发生的未校时事件，并把已结束排风的时长归入对应日期。
   const uint32_t uptimeNow = millis() / 1000UL;
@@ -1678,6 +1850,13 @@ bool statisticsStoreSetClock(uint32_t unixSeconds, int16_t utcOffsetMinutes) {
 
 bool statisticsStoreHasClock() { return clockReady || currentEpoch() != 0; }
 
+const char* statisticsStoreClockSyncSource() {
+  if (!hasClockSyncSource) return "none";
+  return lastClockSyncSource == StatisticsClockSource::kNas ? "nas" : "phone";
+}
+
+bool statisticsStoreTimezoneInitialized() { return timezoneInitialized; }
+
 int32_t statisticsStoreTimezoneOffsetSeconds() {
   return static_cast<int32_t>(timezoneOffsetMinutes) * 60;
 }
@@ -1688,33 +1867,51 @@ const char* statisticsStoreBootId() { return bootIdHex; }
 
 void statisticsStoreRecordActivity(uint16_t mergeGapSeconds) {
   if (!ready || mergeGapSeconds == 0) return;
+  const uint32_t nowMs = millis();
+  const uint32_t previousActivityAtMs = lastActivityAtMs;
+  lastActivityAtMs = nowMs;
   // 未校时时保留逐条 uptime 记录，校时后才能准确按日期回填，不能把跨午夜触发合并到首日。
   if (!currentEpoch()) {
     activeActivityId = 0;
     activeActivityGapSeconds = 0;
+    activeActivityStartedAtMs = 0;
     addEvent(kActivity, kComplete);
     return;
   }
   const EventTimestamp timestamp = eventTimestamp();
   if (activeActivityId && eventCount && events[eventCount - 1].id == activeActivityId) {
     EventRecord& previous = events[eventCount - 1];
-    const uint64_t lastTimestamp = static_cast<uint64_t>(previous.unixSeconds) +
-                                   previous.durationSeconds;
-    if (lastTimestamp <= UINT32_MAX && previous.reserved < UINT16_MAX) {
+    const uint32_t previousDurationSeconds = previous.durationSeconds;
+    const uint64_t previousEndEpoch =
+        static_cast<uint64_t>(previous.unixSeconds) + previousDurationSeconds;
+    const uint32_t sinceLastTriggerMs = uint32_t(nowMs - previousActivityAtMs);
+    const uint32_t elapsedSeconds =
+        uint32_t(nowMs - activeActivityStartedAtMs) / 1000UL;
+    const uint64_t mappedTriggerEpoch =
+        static_cast<uint64_t>(previous.unixSeconds) + elapsedSeconds;
+    if (sinceLastTriggerMs <=
+            static_cast<uint32_t>(activeActivityGapSeconds) * 1000UL &&
+        elapsedSeconds < UINT32_MAX && previousEndEpoch <= UINT32_MAX &&
+        mappedTriggerEpoch <= UINT32_MAX && previous.reserved < UINT16_MAX) {
       StatisticsActivitySegment segment{
-          previous.unixSeconds, static_cast<uint32_t>(lastTimestamp),
+          1, previousDurationSeconds + 1,
           static_cast<uint32_t>(previous.reserved ? previous.reserved : 1),
           activeActivityGapSeconds, true};
       StatisticsActivitySegment completed{};
-      const auto result = statisticsActivityAdd(&segment, timestamp.seconds,
+      const auto result = statisticsActivityAdd(&segment, elapsedSeconds + 1,
                                                 mergeGapSeconds, &completed);
       if (result == StatisticsActivityResult::kExtended) {
         previous.durationSeconds = segment.last - segment.first;
         previous.reserved = static_cast<uint16_t>(segment.count);
+        if (timestamp.clockWentBackwards) {
+          previous.flags |= kEventFlagClockWentBackwards;
+          persistentFlags |= kHeaderFlagClockWentBackwards;
+        }
         lastActivitySpanSeconds = previous.durationSeconds;
         // 只补 (上次末端, 本次触发) 的新增跨度，跨日跨小时切分。
-        addActivitySpanToDaily(static_cast<uint32_t>(lastTimestamp), timestamp.seconds);
-        addActivityTriggerToDaily(timestamp.seconds, false);
+        const uint32_t mappedEnd = static_cast<uint32_t>(mappedTriggerEpoch);
+        addActivitySpanToDaily(static_cast<uint32_t>(previousEndEpoch), mappedEnd);
+        addActivityTriggerToDaily(mappedEnd, false);
         prune();
         persistDeferred();
         return;
@@ -1724,6 +1921,7 @@ void statisticsStoreRecordActivity(uint16_t mergeGapSeconds) {
 
   activeActivityId = 0;
   activeActivityGapSeconds = 0;
+  activeActivityStartedAtMs = 0;
   if (nextEventId == 0) return;
   if (!prepareEventSlot(kActivity)) return;
   const uint32_t eventId = nextEventId;
@@ -1735,10 +1933,12 @@ void statisticsStoreRecordActivity(uint16_t mergeGapSeconds) {
   record.kind = kActivity;
   record.state = kComplete;
   record.endReason = static_cast<uint8_t>(StatisticsEndReason::COMPLETED);
-  record.flags = timestamp.unsynced ? kEventFlagTimeUnsynced : 0;
+  record.flags = timestamp.unsynced ? kEventFlagTimeUnsynced :
+      (timestamp.clockWentBackwards ? kEventFlagClockWentBackwards : 0);
   record.reserved = 1;
   activeActivityId = eventId;
   activeActivityGapSeconds = mergeGapSeconds;
+  activeActivityStartedAtMs = nowMs;
   // 新段开始：上一段的跨度不再属于这次活动，并记录本次段的起点。
   lastActivitySpanSeconds = 0;
   lastActivityStartEpoch = timestamp.seconds;
@@ -1868,7 +2068,7 @@ uint16_t countValidToilets(uint32_t start, uint32_t end, unsigned long activeRun
 }
 
 String statisticsStoreBuildJson(const String& range, bool fanOn, unsigned long activeRunMs,
-                                uint16_t eventOffset) {
+                                uint16_t eventOffset, uint8_t eventLimit) {
   const uint32_t now = currentEpoch();
   const int64_t signedOffsetSeconds = static_cast<int32_t>(timezoneOffsetMinutes) * 60;
   const int64_t localNow = now ? static_cast<int64_t>(now) + signedOffsetSeconds : 0;
@@ -1940,7 +2140,7 @@ String statisticsStoreBuildJson(const String& range, bool fanOn, unsigned long a
       EventRecord event = events[i];
       if (event.state == kActive && static_cast<size_t>(i) == activeEventIndex) event.durationSeconds = activeRunMs / 1000UL;
       if (!eventInRange(event, eventStart, eventEnd)) continue;
-      if (eventTotal >= eventOffset && recentCount < 32) {
+      if (eventTotal >= eventOffset && recentCount < eventLimit) {
         if (recentCount++) eventsJson += ',';
         eventsJson += "{\"id\":" + String(event.id) +
                       ",\"time\":" + String(event.unixSeconds) + ",\"kind\":\"" + kindName(event.kind) +
@@ -1959,6 +2159,7 @@ String statisticsStoreBuildJson(const String& range, bool fanOn, unsigned long a
       "\",\"dataEpoch\":\"" + String(statisticsStoreDataEpoch()) +
       "\",\"bootId\":\"" + String(statisticsStoreBootId()) +
       "\",\"timeSynced\":" + String(statisticsStoreHasClock() ? "true" : "false") +
+      ",\"timeSyncSource\":\"" + String(statisticsStoreClockSyncSource()) + "\"" +
       ",\"active\":" + String(fanOn ? "true" : "false") +
       ",\"range\":\"" + range + "\",\"runtimeSeconds\":" + String(runtimeSeconds) +
       ",\"activityCount\":" + String(activityCount) + ",\"automaticCount\":" + String(automaticCount) +

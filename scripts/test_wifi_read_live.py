@@ -64,9 +64,9 @@ async def run(args):
   await session.connect(args.device)
   for _ in range(15):
    status=await call('wifi.status')
-   if status.get('wifiReadAvailable'):break
+   if status.get('mqttConnected'):break
    await asyncio.sleep(1)
-  else:raise RuntimeError('WIFI_READ_UNAVAILABLE')
+  else:raise RuntimeError('MQTT_NOT_CONNECTED')
   clients=await call('wifi.clients')
   if clients.get('clients'):raise RuntimeError('PRESERVE_EXISTING_CLIENTS')
   suffix=uuid.uuid4().hex[:12];clientA='probe-a-'+suffix;clientB='probe-b-'+suffix;clientC='probe-c-'+suffix
@@ -96,9 +96,9 @@ async def run(args):
   record('ota-checkpoint-with-two-clients')
   for _ in range(30):
    network=await call('wifi.status')
-   if network.get('wifiReadAvailable'):break
+   if network.get('mqttConnected'):break
    await asyncio.sleep(1)
-  else:raise RuntimeError('WIFI_DID_NOT_RESUME')
+  else:raise RuntimeError('MQTT_DID_NOT_RESUME')
   a['host']=b['host']=network['ip']
   # 反复替换，触发 NVS 页回收；OTA 双槽记录同时存在。
   for index in range(args.rotations):
@@ -116,7 +116,7 @@ async def run(args):
   await session.connect(args.device)
   for _ in range(20):
    status=await call('wifi.status')
-   if status.get('wifiReadAvailable'):break
+   if status.get('mqttConnected'):break
    await asyncio.sleep(1)
   if status.get('deviceId')!=a['deviceId']:raise RuntimeError('IDENTITY_CHANGED')
   a['host']=b['host']=status['ip']

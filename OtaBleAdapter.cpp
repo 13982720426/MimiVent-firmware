@@ -8,8 +8,12 @@
 
 namespace OtaBleAdapter {
 namespace {
-constexpr size_t kDataQueueDepth = 12;
-constexpr size_t kControlQueueDepth = 8;
+// OTA 协议窗口 window=4，即同时最多 4 片在途；6 格留 50% 余量，
+// 吸收一次突发写入而不至于把 App 逼进 FLOW|QUEUE_FULL 重传。
+constexpr size_t kDataQueueDepth = 6;
+// 控制命令（CAPS/INFO/BEGIN/ABORT）由 App 串行发送，3 格足够吸收
+// 一次 info+begin 的连续写入，同时保留 1 格兜底。
+constexpr size_t kControlQueueDepth = 3;
 constexpr size_t kCallbackStatusLength = 96;
 QueueHandle_t controlQueue = nullptr;
 QueueHandle_t dataQueue = nullptr;
@@ -42,7 +46,7 @@ class ControlCallbacks final : public NimBLECharacteristicCallbacks {
       publishStatusFromCallback("ERROR|CONTROL_TOO_LONG", info.getConnHandle(), true);
       return;
     }
-    Message message{};
+    ControlMessage message{};
     message.type = MessageType::CONTROL;
     message.connection = info.getConnHandle();
     message.length = value.size();
@@ -73,7 +77,8 @@ class DataCallbacks final : public NimBLECharacteristicCallbacks {
 }  // namespace
 
 void begin() {
-  controlQueue = xQueueCreate(kControlQueueDepth, sizeof(Message));
+  // 控制包上限 kControlBytes(320)，按专用结构分配，每格省约 192 B。
+  controlQueue = xQueueCreate(kControlQueueDepth, sizeof(ControlMessage));
   dataQueue = xQueueCreate(kDataQueueDepth, sizeof(Message));
 }
 
@@ -92,7 +97,18 @@ void registerService(NimBLEService* service) {
 }
 
 bool receiveControl(Message* message) {
-  return controlQueue && xQueueReceive(controlQueue, message, 0) == pdTRUE;
+  if (!controlQueue || !message) return false;
+  // 队列里存的是紧凑的 ControlMessage；这里按实际 length 拷进调用方缓冲，
+  // 上层看到的仍是原来的 Message，行为与字段语义完全不变。
+  ControlMessage stored{};
+  if (xQueueReceive(controlQueue, &stored, 0) != pdTRUE) return false;
+  message->type = stored.type;
+  message->connection = stored.connection;
+  message->length = stored.length <= sizeof(message->bytes) ? stored.length
+                                                            : sizeof(message->bytes);
+  memset(message->bytes, 0, sizeof(message->bytes));
+  memcpy(message->bytes, stored.bytes, message->length);
+  return true;
 }
 
 bool receiveData(Message* message) {

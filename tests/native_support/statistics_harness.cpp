@@ -18,8 +18,8 @@ int main() {
   assert(statisticsStoreSchemaVersion()==7);
   assert(statisticsStoreSetClock(fakeNow,480));
   statisticsStoreRecordActivity(120);
-  fakeNow+=30; statisticsStoreRecordActivity(120);
-  fakeNow+=30; statisticsStoreRecordActivity(120);
+  fakeNow+=30; fakeMillis+=30000; statisticsStoreRecordActivity(120);
+  fakeNow+=30; fakeMillis+=30000; statisticsStoreRecordActivity(120);
   emit("activity_segment",statisticsStoreBuildJson("today",false,0,0));
   // 固件 loop 里由 statisticsStoreTick 负责把合并写入落盘，这里同样推进一次。
   fakeMillis+=6000; statisticsStoreTick();
@@ -28,7 +28,11 @@ int main() {
   statisticsStoreBegin();
   emit("activity_segment_restored",statisticsStoreBuildJson("today",false,0,0));
   statisticsStoreFanStarted(kForce,0);
-  for(int i=0;i<600;i++) { statisticsStoreRecordActivity(60); fakeNow+=61; }
+  for(int i=0;i<600;i++) {
+    statisticsStoreRecordActivity(60);
+    fakeNow+=61;
+    fakeMillis+=61000;
+  }
   assert(eventCount==256);
   assert(activeRun.id!=0); // 明细可淘汰，但运行结算状态不能丢。
   fakeNow+=7200;
